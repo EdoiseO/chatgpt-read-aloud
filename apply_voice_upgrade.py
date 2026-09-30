@@ -29,6 +29,7 @@ import time
 
 from asar_integrity import patch_integrity_slot
 from runtime_voices import read_saved_voice
+from launch_registration import reconcile as reconcile_registration
 from updater_policy import migrate_custom_preferences, report_update_policy
 from updater_policy import validate_bundle_policy, verify_effective_preferences
 
@@ -740,6 +741,10 @@ def launch_existing(config, runner=subprocess.run):
     checked_run([str(config.launcher)], runner)
 
 
+def reconcile_launch_registration(config, runner=subprocess.run):
+    return reconcile_registration(config.target, config.profile, retired=(config.stage,), runner=runner)
+
+
 def profile_pid(config, runner=subprocess.run):
     lock = config.profile / 'SingletonLock'
     if not lock.is_symlink():
@@ -849,7 +854,8 @@ def preflight(config, verify=verify_bundle, runner=subprocess.run):
         raise RuntimeError('The staged voice-build verification report is not ready.')
     readiness = json.loads(config.verification_report.read_text())
     flags = ('signaturesVerified', 'embeddedAsarIntegrityVerified', 'permanentProfilePreserved',
-             'voicePickerHooksVerified', 'selectionHighlightHooksVerified')
+             'voicePickerHooksVerified', 'selectionHighlightHooksVerified',
+             'manualUpdateCheckVerified', 'realtimeReadingControlsVerified', 'persistentReadingControlsVerified')
     if (readiness.get('app') != str(config.stage.resolve(strict=True))
             or readiness.get('version') != staged['CFBundleShortVersionString']
             or readiness.get('activation') != 'staged'
@@ -874,7 +880,8 @@ def preflight(config, verify=verify_bundle, runner=subprocess.run):
     return installed, staged
 
 
-def restore_previous(config, record, previous, wait_seconds, verify, wait, blockers, launch, exchange):
+def restore_previous(config, record, previous, wait_seconds, verify, wait, blockers, launch, exchange,
+                     runner=subprocess.run):
     """Reverse-exchange only after quit; the target path is never removed."""
     pending = {**record, 'status': 'rollback_waiting_for_quit', 'previousAppPath': str(previous),
                'startupPassed30Seconds': False}
@@ -893,19 +900,28 @@ def restore_previous(config, record, previous, wait_seconds, verify, wait, block
         raise RuntimeError('Activation failed; quit the custom app, then run --rollback. Its previous bundle is preserved at the recorded path.') from None
     # The old app is now safely restored. Failure preserving the failed upgrade
     # must never exchange it back or remove the restored target.
-    restored = {**record, 'status': 'rolled_back' if previous == config.stage else 'rolled_back_recovery_pending',
+    restored = {**record, 'status': 'rolled_back_recovery_pending',
                 'previousAppPath': str(config.target),
-                'failedUpgradePath': str(previous), 'startupPassed30Seconds': False}
+                'failedUpgradePath': str(previous), 'startupPassed30Seconds': False,
+                'launchRegistration': {'currentAppRegistered': False}}
     atomic_report(config, restored)
+    preservation_pending = False
     if previous != config.stage:
         try:
             if config.stage.exists() or config.stage.is_symlink():
                 raise RuntimeError('The staged recovery path is occupied.')
             previous.rename(config.stage)
             restored['failedUpgradePath'] = str(config.stage)
-            restored['status'] = 'rolled_back'
         except Exception:
-            restored['status'] = 'rolled_back_recovery_pending'
+            preservation_pending = True
+    atomic_report(config, restored)
+    try:
+        restored['launchRegistration'] = reconcile_launch_registration(config, runner)
+    except Exception:
+        atomic_report(config, restored)
+        raise RuntimeError('The previous app is restored, but launch registration needs recovery; run --rollback to retry.') from None
+    if not preservation_pending:
+        restored['status'] = 'rolled_back'
     atomic_report(config, restored)
     try:
         launch(config)
@@ -975,6 +991,13 @@ def apply_upgrade(config, wait_seconds=1800, verify=verify_bundle, blockers=proc
             record['updaterPolicyMigration'] = migrate_policy(config, runner)
             if blockers(config):
                 raise RuntimeError('The custom app restarted during updater migration; no bundle was replaced.')
+            # Retire an enabled stage registration while its signed bundle is
+            # still present. After exchange/rename, LaunchServices may retain
+            # that pathname; a disabled stale record needs no missing-file guess.
+            record['preExchangeLaunchRegistration'] = reconcile_launch_registration(config, runner)
+            atomic_report(config, record)
+            if blockers(config):
+                raise RuntimeError('The custom app restarted during pre-exchange launch registration; no bundle was replaced.')
         except Exception:
             atomic_report(config, {**record, 'status': 'recheck_failed'})
             raise
@@ -998,6 +1021,10 @@ def apply_upgrade(config, wait_seconds=1800, verify=verify_bundle, blockers=proc
             verify(config, config.target, installed['CFBundleShortVersionString'], True)
             if blockers(config):
                 raise RuntimeError('The custom app restarted before upgraded startup validation.')
+            record['launchRegistration'] = reconcile_launch_registration(config, runner)
+            atomic_report(config, record)
+            if blockers(config):
+                raise RuntimeError('The custom app restarted during launch registration.')
             launch(config)
             pid = startup(config)
             checked_run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(config.official)], runner)
@@ -1007,14 +1034,15 @@ def apply_upgrade(config, wait_seconds=1800, verify=verify_bundle, blockers=proc
             return record
         except Exception:
             if exchanged:
-                restore_previous(config, record, previous, wait_seconds, verify, wait, blockers, launch, exchange)
+                restore_previous(config, record, previous, wait_seconds, verify, wait, blockers, launch, exchange, runner)
             else:
                 atomic_report(config, {**record, 'status': 'exchange_failed', 'previousAppPath': str(config.target)})
             raise RuntimeError('Voice-upgrade activation failed; the previous app was restored when safe.') from None
 
 
 def rollback_saved(config, wait_seconds=1800, verify=verify_bundle,
-                   wait=wait_until_stopped, blockers=process_blockers, launch=launch_existing, exchange=None):
+                   wait=wait_until_stopped, blockers=process_blockers, launch=launch_existing, exchange=None,
+                   runner=subprocess.run):
     exchange = atomic_exchange if exchange is None else exchange
     with activation_lock(config):
         record = transaction_record(config, strict=True)
@@ -1035,8 +1063,13 @@ def rollback_saved(config, wait_seconds=1800, verify=verify_bundle,
                 if blockers(config) or config.stage.exists() or config.stage.is_symlink():
                     raise RuntimeError('The app is running or its recovery staging path is occupied.')
                 failed.rename(config.stage)
-            atomic_report(config, {**record, 'status': 'rolled_back', 'previousAppPath': str(config.target),
-                                  'failedUpgradePath': str(config.stage)})
+            restored = {**record, 'status': 'rolled_back_recovery_pending', 'previousAppPath': str(config.target),
+                        'failedUpgradePath': str(config.stage), 'startupPassed30Seconds': False,
+                        'launchRegistration': {'currentAppRegistered': False}}
+            atomic_report(config, restored)
+            restored['launchRegistration'] = reconcile_launch_registration(config, runner)
+            restored['status'] = 'rolled_back'
+            atomic_report(config, restored)
             launch(config)
             return
         # Recorded reports can precede a successful backup rename or reverse
@@ -1050,7 +1083,7 @@ def rollback_saved(config, wait_seconds=1800, verify=verify_bundle,
                     break
         if previous is None:
             raise RuntimeError('The verified previous app is not at a transaction recovery path.')
-        restore_previous(config, record, previous, wait_seconds, verify, wait, blockers, launch, exchange)
+        restore_previous(config, record, previous, wait_seconds, verify, wait, blockers, launch, exchange, runner)
 
 
 def schedule_detached(config, wait_seconds):

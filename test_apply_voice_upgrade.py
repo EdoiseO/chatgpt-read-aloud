@@ -72,6 +72,8 @@ def fixture():
                   'packedAssetsVerified': 20000, 'signaturesVerified': True,
                   'embeddedAsarIntegrityVerified': True, 'permanentProfilePreserved': True,
                   'voicePickerHooksVerified': True, 'selectionHighlightHooksVerified': True,
+                  'manualUpdateCheckVerified': True, 'realtimeReadingControlsVerified': True,
+                  'persistentReadingControlsVerified': True,
                   'runtimeWorkerPath': str(worker), 'runtimeWorkerHash': hashlib.sha256(worker.read_bytes()).hexdigest(),
                   'asarHeaderHash': HEADER_HASH, 'mainModuleHash': MAIN_HASH}
         config.verification_report.write_text(json.dumps(report))
@@ -85,7 +87,9 @@ def fixture():
                     'SUEnableAutomaticChecks': False, 'SUAutomaticallyUpdate': False}), \
                 patch.object(upgrade, 'report_update_policy', return_value={
                     'hostUpdaterDisabled': True, 'savedPreferencesConflict': False,
-                    'manualUpdatesBlocked': True}):
+                    'manualUpdatesBlocked': True}), \
+                patch.object(upgrade, 'reconcile_launch_registration',
+                             return_value={'currentAppRegistered': True, 'retiredAppsUnregistered': []}):
             yield config
 
 
@@ -188,6 +192,198 @@ def atomic_record(config):
 
 
 class ActivationTests(unittest.TestCase):
+    def test_readiness_requires_update_check_and_persistent_realtime_reading_verification(self):
+        for flag in ('manualUpdateCheckVerified', 'realtimeReadingControlsVerified', 'persistentReadingControlsVerified'):
+            for value in (None, False, 1):
+                with self.subTest(flag=flag, value=value), fixture() as config:
+                    report = json.loads(config.verification_report.read_text())
+                    if value is None:
+                        report.pop(flag)
+                    else:
+                        report[flag] = value
+                    config.verification_report.write_text(json.dumps(report))
+                    with self.assertRaisesRegex(RuntimeError, 'does not match this ready build'):
+                        upgrade.preflight(config, fake_verify, successful_runner)
+
+    def test_launch_registration_runs_before_exchange_and_again_before_launch(self):
+        with fixture() as config:
+            events = []
+            def reconcile(cfg, runner):
+                marker = (cfg.target / 'marker').read_text()
+                self.assertEqual(cfg.stage.exists(), marker == 'old')
+                self.assertEqual(json.loads(cfg.report.read_text())['status'],
+                                 'waiting_for_quit' if marker == 'old' else 'verifying_startup')
+                events.append('register-' + marker)
+                return {'currentAppRegistered': True}
+            def launch(_):
+                self.assertEqual(events, ['register-old', 'register-new'])
+                events.append('launch')
+            with patch.object(upgrade, 'reconcile_launch_registration', side_effect=reconcile):
+                record = upgrade.apply_upgrade(config, verify=fake_verify, blockers=lambda _: [],
+                    wait=no_wait, launch=launch, startup=lambda _: 123, runner=successful_runner)
+            self.assertTrue(record['launchRegistration']['currentAppRegistered'])
+            self.assertTrue(record['preExchangeLaunchRegistration']['currentAppRegistered'])
+            self.assertEqual(events, ['register-old', 'register-new', 'launch'])
+
+    def test_enabled_stage_registration_is_retired_before_its_path_disappears(self):
+        with fixture() as config:
+            # Use the real reconciler with an isolated LaunchServices database.
+            # The fake retains the disabled stage record after its bundle moves.
+            target, stage = config.target.resolve(), config.stage.resolve()
+            for bundle in (target, stage):
+                (bundle / 'Contents/MacOS').mkdir(parents=True)
+                (bundle / 'Contents/Info.plist').write_bytes(plistlib.dumps({
+                    'CFBundleIdentifier': upgrade.IDENTITY, 'CFBundleExecutable': 'ChatGPT',
+                    'LSEnvironment': {'CODEX_ELECTRON_USER_DATA_PATH': str(config.profile)}}))
+                for name in ('ChatGPT', 'ChatGPT-native'):
+                    executable = bundle / 'Contents/MacOS' / name
+                    executable.write_bytes(b'# isolated executable fixture\n')
+                    executable.chmod(0o755)
+            disabled, snapshots, events = {target: False, stage: False}, {}, []
+            def dump(bundle):
+                if not bundle.exists():
+                    return snapshots[bundle]
+                return (f'bundle id: fixture (0x1)\npath: {bundle} (0x2)\nidentifier: {upgrade.IDENTITY}\n'
+                        f'bundle flags: has-display-name {"launch-disabled" if disabled[bundle] else ""} wildcard (00000002)\n'
+                        f'inode: {bundle.stat().st_ino}\nexec inode: {(bundle / "Contents/MacOS/ChatGPT").stat().st_ino}\n')
+            def runner(args, **_kwargs):
+                output = ''
+                if str(args[0]).endswith('/lsregister'):
+                    if args[1] == '-dump':
+                        output = ''.join(dump(bundle) for bundle in disabled)
+                    elif args[1] == '-u':
+                        bundle = Path(args[2])
+                        self.assertEqual(bundle, stage)
+                        self.assertTrue(bundle.exists(), 'Retire the stage while its identity can be verified')
+                        disabled[bundle] = True
+                        snapshots[bundle] = dump(bundle)
+                        events.append('retire-stage')
+                    elif args[1] == '-f':
+                        self.assertEqual(Path(args[2]), target)
+                        disabled[target] = False
+                    else:
+                        self.fail('No global registration operation is allowed')
+                return SimpleNamespace(returncode=0, stdout=output, stderr='')
+            def reconcile(cfg, runner):
+                return upgrade.reconcile_registration(cfg.target.resolve(), cfg.profile,
+                    retired=(cfg.stage.resolve(),), runner=runner)
+            def exchange(left, right):
+                if left == config.target:
+                    self.assertTrue(disabled[stage])
+                    self.assertEqual(events, ['retire-stage'])
+                    events.append('exchange')
+                upgrade.atomic_exchange(left, right)
+            with patch.object(upgrade, 'reconcile_launch_registration', side_effect=reconcile):
+                record = upgrade.apply_upgrade(config, verify=fake_verify, blockers=lambda _: [], wait=no_wait,
+                    launch=lambda _: events.append('launch'), startup=lambda _: 123, runner=runner, exchange=exchange)
+            self.assertEqual(events, ['retire-stage', 'exchange', 'launch'])
+            self.assertFalse(stage.exists())
+            self.assertEqual(record['status'], 'activated')
+            self.assertEqual(record['preExchangeLaunchRegistration']['retiredAppsUnregistered'], [str(stage)])
+            self.assertEqual(record['launchRegistration']['retiredAppsUnregistered'], [])
+            self.assertEqual((config.target / 'marker').read_text(), 'new')
+
+    def test_pre_exchange_registration_failure_preserves_both_apps_without_launch(self):
+        with fixture() as config:
+            def exchange(left, right):
+                self.assertNotIn(config.target, (left, right), 'A failed registration must not publish either app')
+                upgrade.atomic_exchange(left, right)
+            with patch.object(upgrade, 'reconcile_launch_registration', side_effect=RuntimeError('registration failed')):
+                with self.assertRaisesRegex(RuntimeError, 'registration failed'):
+                    upgrade.apply_upgrade(config, verify=fake_verify, blockers=lambda _: [], wait=no_wait,
+                        launch=lambda _: self.fail('No launch'), runner=successful_runner, exchange=exchange)
+            self.assertEqual((config.target / 'marker').read_text(), 'old')
+            self.assertEqual((config.stage / 'marker').read_text(), 'new')
+            record = json.loads(config.report.read_text())
+            self.assertEqual(record['status'], 'recheck_failed')
+            self.assertFalse(Path(record['backup']).exists())
+
+    def test_restart_during_pre_exchange_registration_prevents_publication(self):
+        with fixture() as config:
+            registered = False
+            def reconcile(*_args):
+                nonlocal registered
+                registered = True
+                return {'currentAppRegistered': True}
+            def exchange(left, right):
+                self.assertNotIn(config.target, (left, right))
+                upgrade.atomic_exchange(left, right)
+            with patch.object(upgrade, 'reconcile_launch_registration', side_effect=reconcile):
+                with self.assertRaisesRegex(RuntimeError, 'restarted during pre-exchange launch registration'):
+                    upgrade.apply_upgrade(config, verify=fake_verify, blockers=lambda _: [123] if registered else [],
+                        wait=no_wait, launch=lambda _: self.fail('No launch'), runner=successful_runner, exchange=exchange)
+            self.assertEqual((config.target / 'marker').read_text(), 'old')
+            self.assertEqual((config.stage / 'marker').read_text(), 'new')
+            self.assertEqual(json.loads(config.report.read_text())['status'], 'recheck_failed')
+
+    def test_read_only_preflight_does_not_reconcile_launch_registration(self):
+        with fixture() as config:
+            with patch.object(upgrade, 'reconcile_launch_registration', side_effect=AssertionError('Read-only check must not register apps')) as reconcile:
+                upgrade.preflight(config, fake_verify, successful_runner)
+            reconcile.assert_not_called()
+            self.assertFalse(config.report.exists())
+
+    def test_failed_registration_restores_and_registers_previous_before_reopening(self):
+        with fixture() as config:
+            attempts, launches = [], []
+            def reconcile(cfg, runner):
+                attempts.append((cfg.target / 'marker').read_text())
+                if len(attempts) == 2:
+                    raise RuntimeError('registration failed')
+                return {'currentAppRegistered': True}
+            with patch.object(upgrade, 'reconcile_launch_registration', side_effect=reconcile):
+                with self.assertRaisesRegex(RuntimeError, 'activation failed'):
+                    upgrade.apply_upgrade(config, verify=fake_verify, blockers=lambda _: [], wait=no_wait,
+                        launch=lambda cfg: launches.append((cfg.target / 'marker').read_text()),
+                        startup=lambda _: self.fail('Unregistered upgrade cannot start'), runner=successful_runner)
+            self.assertEqual(attempts, ['old', 'new', 'old'])
+            self.assertEqual(launches, ['old'])
+            record = json.loads(config.report.read_text())
+            self.assertEqual(record['status'], 'rolled_back')
+            self.assertFalse(record['startupPassed30Seconds'])
+            self.assertTrue(record['launchRegistration']['currentAppRegistered'])
+
+    def test_registration_failure_after_rollback_remains_retryable_without_another_exchange(self):
+        with fixture() as config:
+            with patch.object(upgrade, 'reconcile_launch_registration', side_effect=[
+                    {'currentAppRegistered': True}, RuntimeError('offline registry'), RuntimeError('offline registry')]):
+                with self.assertRaisesRegex(RuntimeError, 'launch registration needs recovery'):
+                    upgrade.apply_upgrade(config, verify=fake_verify, blockers=lambda _: [], wait=no_wait,
+                        launch=lambda _: self.fail('No unregistered app may launch'), runner=successful_runner)
+            record = json.loads(config.report.read_text())
+            self.assertEqual(record['status'], 'rolled_back_recovery_pending')
+            self.assertFalse(record['launchRegistration']['currentAppRegistered'])
+            self.assertEqual((config.target / 'marker').read_text(), 'old')
+            self.assertEqual((config.stage / 'marker').read_text(), 'new')
+            def exchange(left, right):
+                self.assertNotEqual(left, config.target)
+                upgrade.atomic_exchange(left, right)
+            launches = []
+            with patch.object(upgrade, 'reconcile_launch_registration', side_effect=RuntimeError('retry failed')):
+                with self.assertRaisesRegex(RuntimeError, 'retry failed'):
+                    upgrade.rollback_saved(config, verify=fake_verify, blockers=lambda _: [], wait=no_wait,
+                        launch=lambda _: self.fail('No launch'), exchange=exchange, runner=successful_runner)
+            self.assertEqual(json.loads(config.report.read_text())['status'], 'rolled_back_recovery_pending')
+            upgrade.rollback_saved(config, verify=fake_verify, blockers=lambda _: [], wait=no_wait,
+                launch=lambda _: launches.append(True), exchange=exchange, runner=successful_runner)
+            self.assertEqual(json.loads(config.report.read_text())['status'], 'rolled_back')
+            self.assertEqual(launches, [True])
+
+    def test_interrupted_registration_keeps_transaction_recoverable(self):
+        with fixture() as config:
+            with patch.object(upgrade, 'reconcile_launch_registration', side_effect=[
+                    {'currentAppRegistered': True}, KeyboardInterrupt()]):
+                with self.assertRaises(KeyboardInterrupt):
+                    upgrade.apply_upgrade(config, verify=fake_verify, blockers=lambda _: [], wait=no_wait,
+                        launch=lambda _: self.fail('No launch'), runner=successful_runner)
+            record = json.loads(config.report.read_text())
+            self.assertEqual(record['status'], 'verifying_startup')
+            self.assertEqual((config.target / 'marker').read_text(), 'new')
+            self.assertEqual((Path(record['backup']) / 'marker').read_text(), 'old')
+            upgrade.rollback_saved(config, verify=fake_verify, blockers=lambda _: [], wait=no_wait,
+                launch=lambda _: None, runner=successful_runner)
+            self.assertEqual(json.loads(config.report.read_text())['status'], 'rolled_back')
+
     def test_updater_preferences_migrate_after_quit_before_publication(self):
         with fixture() as config:
             events = []

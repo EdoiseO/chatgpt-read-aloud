@@ -17,13 +17,13 @@ import sys
 import tempfile
 
 import configure_launcher
+from launch_registration import REGISTER, reconcile as reconcile_registration
 from updater_policy import migrate_custom_preferences
 from build_copy import VERSION
 from setup_runtime import SUPPORT, ensure_home_directory, file_digest, load_manifest, regular_input, require_platform
 
 ROOT = Path(__file__).resolve().parent
 IDENTITY = 'local.edoise.codex.readaloud'
-REGISTER = '/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
 AT_FDCWD = -2
 RENAME_EXCL = 0x00000004  # Darwin sys/stdio.h; do not replace a racing target.
 
@@ -154,7 +154,9 @@ def verify_staged_app(app, report, runner=subprocess.run):
             or result.get('packedAssetsVerified', 0) <= 0
             or any(result.get(flag) is not True for flag in
                    ('signaturesVerified', 'embeddedAsarIntegrityVerified', 'voicePickerHooksVerified',
-                    'selectionHighlightHooksVerified', 'permanentProfilePreserved'))):
+                    'selectionHighlightHooksVerified', 'permanentProfilePreserved',
+                    'manualUpdateCheckVerified', 'realtimeReadingControlsVerified',
+                    'persistentReadingControlsVerified'))):
         raise RuntimeError('The scratch app did not pass complete asset, signature, and profile verification.')
 
 
@@ -218,7 +220,7 @@ def install_fresh(config=Config(), runner=subprocess.run, configure=None, verify
             published = True
         checked_run(['/usr/bin/codesign', '--verify', '--deep', '--strict', config.target], runner)
         checked_run(['/usr/bin/codesign', '--verify', '--deep', '--strict', config.official], runner)
-        checked_run([REGISTER, '-f', config.target], runner)
+        reconcile_registration(config.target, config.profile, runner=runner)
         return {'app': str(config.target), 'profile': str(config.profile), 'launcher': str(config.launcher)}
     except BaseException:
         # An interruption can occur just after the native publication returns.

@@ -44,6 +44,11 @@ def fixture():
             commands.append((list(arguments), kwargs))
             if '-c' in arguments and 'sys.version_info' in arguments[-1]:
                 output = json.dumps({'version': [3, 13], 'machine': 'arm64', 'system': 'Darwin'})
+            elif arguments == [install.REGISTER, '-dump']:
+                target = root / 'Applications/ChatGPT Read Aloud.app'
+                output = (f'bundle id: ChatGPT (0x123)\npath: {target} (0x456)\nidentifier: {install.IDENTITY}\n'
+                          f'bundle flags: wildcard (0000000010000002)\ninode: {target.stat().st_ino}\n'
+                          f'exec inode: {(target / "Contents/MacOS/ChatGPT").stat().st_ino}\n')
             else:
                 output = ''
             if '-m' in arguments and 'venv' in arguments:
@@ -91,7 +96,9 @@ def configure_fixture(app, profile, register):
     info_path.write_bytes(plistlib.dumps(info))
     main = app / 'Contents/MacOS/ChatGPT'
     main.rename(main.with_name('ChatGPT-native'))
+    main.with_name('ChatGPT-native').chmod(0o755)
     main.write_bytes(b'# fixture profile wrapper\n')
+    main.chmod(0o755)
 
 
 def publish_fixture(source, target):
@@ -395,8 +402,12 @@ class BootstrapTests(unittest.TestCase):
             base = {'app': str(config.app.resolve()), 'version': install.VERSION, 'packedAssetsVerified': 42,
                     'signaturesVerified': True, 'embeddedAsarIntegrityVerified': True,
                     'voicePickerHooksVerified': True, 'selectionHighlightHooksVerified': True,
-                    'permanentProfilePreserved': True}
-            for change in ({}, {'signaturesVerified': False}, {'app': str(config.official)}, {'packedAssetsVerified': 0}):
+                    'permanentProfilePreserved': True, 'manualUpdateCheckVerified': True,
+                    'realtimeReadingControlsVerified': True, 'persistentReadingControlsVerified': True}
+            changes = [{}, {'signaturesVerified': False}, {'app': str(config.official)}, {'packedAssetsVerified': 0}]
+            changes.extend({flag: False} for flag in
+                           ('manualUpdateCheckVerified', 'realtimeReadingControlsVerified', 'persistentReadingControlsVerified'))
+            for change in changes:
                 def runner(arguments, **kwargs):
                     self.assertIn('--app', arguments)
                     report.write_text(json.dumps({**base, **change}))

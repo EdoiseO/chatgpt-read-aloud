@@ -163,6 +163,16 @@ attempt to read with no saved choice should open the picker.
 
 ## Updating an existing custom installation
 
+Use **Check for Updates…** in the app menu to check the public official feed.
+It reports the installed version/build, the public release, and whether its
+Read Aloud adapter has been reviewed. A successful check does not install an app
+or certify playback on a newer release. Availability in this feed can differ
+from your account's rollout. Network or feed errors are shown as failed checks.
+
+The installer below currently supports changes within the same official version.
+Cross-version installation requires a reviewed adapter, a complete fresh app
+bundle, and verified profile migration/recovery; it is not enabled by the checker.
+
 Keep the current private profile, runtime, saved voice, launcher, activation
 journal, and recorded verified backup aliases. Do not run the fresh installer or
 delete those paths to make an update fit. Do not overwrite a running app bundle
@@ -228,10 +238,17 @@ snapshot is informational; no saved choice remains valid for the first-time pick
 Unresolved, unreadable, or invalid recovery journals block a new activation.
 Complete recorded recovery before preparing another transaction.
 
+Before reopening, activation and rollback reconcile the custom app's macOS
+launch registrations. Verified retired copies are unregistered and the installed
+path is registered again. Backup files remain available for recorded recovery.
+The installer verifies that only the current copy is enabled for launching;
+disabled backup records may remain in the macOS database.
+
 After quit and before publication, activation disables the custom copy's saved
 automatic update checks/downloads. The launcher also forces the host's updater
-switch off before startup. This blocks automatic and manual in-app updates;
-use this staged rebuild procedure to upgrade the custom copy. Activation checks
+switch off before startup. The original updater cannot replace the custom app;
+the separate manual checker reads release metadata. Use this staged rebuild
+procedure to install a compatible custom build. Activation checks
 the switch, absence of the loaded Sparkle addon, and saved preferences again
 after launch. The official app's settings are untouched. Inspect `updaterPolicy`
 in the verification report.
@@ -279,6 +296,9 @@ automation cannot control Codex.
 
 - **Whole response:** with no selection, its speaker reads that response's
   visible text. Link labels are spoken; raw Markdown link URLs are not added.
+- **Response layouts:** check an older reply without hovering, a reply with an
+  edited-file card, and a completed voice-session reply containing paragraphs or
+  a table. Reading controls remain visible. Check selected text in each layout.
 - **Selected passage:** select part of that response and use its speaker or the
   floating **Read aloud** action. Only the selected passage is spoken. A
   selection spanning separate responses must not be accepted as one passage.
@@ -298,7 +318,11 @@ automation cannot control Codex.
   response switching. Native blue selection and response markup remain intact.
 - **Profiles and restarts:** a fresh installation uses its blank dedicated
   profile; an update retains the existing profile and voice. Reopen through both
-  the normal app icon and the optional launcher.
+  the normal app icon and the optional launcher. Also check the Dock and app
+  search resolve to the current installation after an upgrade or rollback.
+- **Update checker:** choose **Check for Updates…**. It should report official
+  availability and compatibility without starting an installation. Repeat after
+  a menu rebuild or reopening. A failed check must not claim the app is current.
 - **Integrity:** the installed custom app verifies, and the original official
   app still verifies. Keep the local build/activation reports for diagnosis.
 

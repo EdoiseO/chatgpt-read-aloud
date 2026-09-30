@@ -19,6 +19,8 @@ from asar_integrity import patch_integrity_slot
 from build_copy import ASSET, SELECTION_ASSET, SELECTION_BUTTON, EARLY, PRELOAD, MAIN, FRAMEWORK, RESOURCE, VERSION
 from runtime_voices import read_saved_voice, supported_voice_ids
 from updater_host_gate import HOST_GATE_ASSETS, validate_host_gate_assets
+from speech_host_adapter import validate_patched_toolbar
+from update_menu_adapter import HOST_MENU_ASSET, UPDATE_MAIN, validate_update_menu
 
 ROOT = Path(__file__).resolve().parent
 MAX_HEADER_BYTES = 64 * 1024 * 1024
@@ -123,7 +125,7 @@ def verify_archive(path, recorded_hash):
             require(digest.hexdigest() == item['integrity']['hash'], f'ASAR packed asset SHA256 disagrees: {key}')
             require(blocks == item['integrity']['blocks'], f'ASAR packed block hashes disagree: {key}')
             count += 1
-            if key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN, *HOST_GATE_ASSETS):
+            if key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN, HOST_MENU_ASSET, UPDATE_MAIN, *HOST_GATE_ASSETS):
                 require(size <= MAX_HOOK_BYTES, f'ASAR speech hook exceeds the verification limit: {key}')
                 stream.seek(body + offset)
                 try:
@@ -202,8 +204,17 @@ def verify_build(app, *, home=None, official=Path('/Applications/ChatGPT.app'), 
     recorded = info.get('ElectronAsarIntegrity', {}).get('Resources/app.asar', {}).get('hash')
     hooks, count, header_hash = verify_archive(app / RESOURCE, recorded)
     validate_host_gate_assets({key: value.encode('utf-8') for key, value in hooks.items() if key in HOST_GATE_ASSETS})
-    for key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN):
+    for key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN, HOST_MENU_ASSET, UPDATE_MAIN):
         require(key in hooks, f'Required speech hook asset is missing: {key}')
+    speech_host = validate_patched_toolbar(hooks[ASSET])
+    validate_update_menu(hooks[HOST_MENU_ASSET])
+    require(type(info.get('CodexReadAloudUpdateCheckerVersion')) is int and
+            info['CodexReadAloudUpdateCheckerVersion'] == 1, 'Manual update checker marker is missing')
+    require(type(info.get('CodexReadAloudSpeechHostAdapterVersion')) is int and
+            info['CodexReadAloudSpeechHostAdapterVersion'] == 1, 'Speech host adapter marker is missing')
+    update_checker_hash = hashlib.sha256(hooks[UPDATE_MAIN].encode()).hexdigest()
+    require(update_checker_hash == hashlib.sha256((source_root / 'update-checker.cjs').read_bytes()).hexdigest(),
+            'Bundled manual update checker is stale')
     require(hooks[EARLY].count('require("./local-read-aloud-main.cjs")') == 1, 'Main bootstrap hook is missing or duplicated')
     require(hooks[PRELOAD].count('exposeInMainWorld("codexLocalReadAloud"') == 1, 'Speech preload bridge is missing or duplicated')
     require(hooks[ASSET].count('function CodexReadAloudVoicePicker(') == 1, 'Voice-picker hook is missing or duplicated')
@@ -240,6 +251,9 @@ def verify_build(app, *, home=None, official=Path('/Applications/ChatGPT.app'), 
             'signaturesVerified': True, 'embeddedAsarIntegrityVerified': True,
             'permanentProfilePreserved': True, 'voicePickerHooksVerified': True,
             'selectionHighlightHooksVerified': True, 'codeBlockSkippingVerified': True,
+            'speechHostAdapter': speech_host,
+            'manualUpdateCheckVerified': True, 'manualUpdateCheckerHash': update_checker_hash,
+            'realtimeReadingControlsVerified': True, 'persistentReadingControlsVerified': True,
             'runtimeWorkerPath': str(worker_path), 'runtimeWorkerHash': worker_hash,
             'runtimeProtocolVersion': 2, 'voiceChoice': selected_voice,
             'voiceName': selected_voice.split('_', 1)[1].title() if selected_voice else None,

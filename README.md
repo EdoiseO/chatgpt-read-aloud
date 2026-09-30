@@ -9,6 +9,7 @@ own profile.
 ## Features
 
 - Read a completed response or **just the text you select**, skipping code blocks.
+- Read completed voice-session replies, with reading controls that stay visible.
 - Follow a **soft yellow highlight** during Kokoro playback.
 - Stop playback or switch to another response.
 - Preview and save your choice of **28 English voices**.
@@ -36,11 +37,18 @@ as a patched copy; there is no official plugin integration or affiliation with O
 
 ## Updates
 
-Automatic and manual in-app updates are disabled in the custom copy. Follow the
+**Check for Updates…** in the app menu checks the public official release feed
+and shows whether that release has a reviewed Read Aloud adapter. Checking is
+manual and downloads only release metadata. A new official release can appear
+before it reaches your account's rollout.
+
+Installing a newer official release still requires a compatible rebuild. Follow the
 **[update guide](docs/INSTALLATION.md#updating-an-existing-custom-installation)**
 to prepare and verify a compatible build, then quit normally when the installer
 is ready. The installer preserves your profile and saved voice, keeps the previous
-app for rollback, and checks startup before marking the upgrade complete.
+app for rollback, reconciles macOS launch registrations, and checks startup before
+marking the upgrade complete. The original automatic installer remains disabled
+in the custom copy because it can replace the patched app.
 The official ChatGPT app's updates remain independent.
 
 [Behavior details and development notes](docs/DEVELOPMENT.md).

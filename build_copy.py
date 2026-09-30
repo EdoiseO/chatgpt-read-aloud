@@ -12,17 +12,17 @@ import subprocess
 
 from asar_integrity import patch_integrity_slot, rewrite_embedded_integrity
 from updater_host_gate import HOST_GATE_ASSETS, validate_host_gate_assets
+from speech_host_adapter import TOOLBAR_ASSET, patch_toolbar, append_payload
+from update_menu_adapter import HOST_MENU_ASSET, UPDATE_MAIN, patch_update_menu
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = Path('/Applications/ChatGPT.app')
 TARGET = ROOT / 'build/ChatGPT Read Aloud.app'
 RESOURCE = Path('Contents/Resources/app.asar')
 FRAMEWORK = Path('Contents/Frameworks/Codex Framework.framework/Versions/Current/Codex Framework')
-ASSET = 'webview/assets/sites-end-resource-ac1aa5fe0447.js'
+ASSET = TOOLBAR_ASSET
 SELECTION_ASSET = 'webview/assets/app-primary-92c16ff2fe4e.js'
 VERSION = '26.928.20755'
-ANCHOR = '}}),E,A,r===void 0?ae:'
-INSERT = '}}),re==null?null:(0,Y.jsx)(CodexLocalReadAloudButton,{getText:()=>Sr(f?.()??re),getHtml:()=>h?.(),getRoot:codexResponseRootGetter}),E,A,r===void 0?ae:'
 EARLY = '.vite/build/early-bootstrap.js'
 PRELOAD = '.vite/build/preload.js'
 MAIN = '.vite/build/local-read-aloud-main.cjs'
@@ -173,7 +173,7 @@ def main():
         if body + max(offset + size for _, offset, size in original_entries) != original.stat().st_size:
             raise SystemExit('Unexpected archive body layout')
         source_js = {}
-        for key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, *HOST_GATE_ASSETS):
+        for key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, HOST_MENU_ASSET, *HOST_GATE_ASSETS):
             item = leaf(tree, key)
             stream.seek(body + int(item['offset']))
             data = stream.read(item['size'])
@@ -188,15 +188,8 @@ def main():
     picker = (ROOT / 'voice-picker.js').read_text()
     component = (ROOT / 'response-button.js').read_text()
     highlighting = (ROOT / 'response-highlight.mjs').read_text().replace('export ', '')
-    javascript = exact_replace(source_js[ASSET], ANCHOR, INSERT, 'Toolbar')
-    javascript = exact_replace(javascript, 'actionRowRef:M}=e,N=',
-                               'actionRowRef:M,getReadAloudRoot:codexResponseRootGetter}=e,N=', 'Response root props')
-    javascript = exact_replace(javascript, 'getCopyHtml:W?We:void 0,',
-                               'getCopyHtml:W?We:void 0,getReadAloudRoot:()=>ye.current?.querySelector(`[data-selected-text-overlay-target]`),', 'Scoped response root')
-    marker = javascript.rfind('export{')
-    if marker < 0:
-        raise SystemExit('Expected export boundary missing')
-    javascript = javascript[:marker] + '\n' + manager + '\n' + kokoro + '\n' + highlighting + '\n' + picker + '\n' + component + '\n' + javascript[marker:]
+    javascript = append_payload(patch_toolbar(source_js[ASSET]),
+                                '\n'.join((manager, kokoro, highlighting, picker, component)))
     replacement = javascript.encode('utf-8')
     (ROOT / 'patched-toolbar.mjs').write_bytes(replacement)
     subprocess.run(['node', '--check', str(ROOT / 'patched-toolbar.mjs')], check=True)
@@ -209,8 +202,10 @@ def main():
         PRELOAD: exact_replace(source_js[PRELOAD], PRELOAD_ANCHOR,
                                BRIDGE + ',' + PRELOAD_ANCHOR, 'Preload').encode(),
         MAIN: (ROOT / 'kokoro-main.cjs').read_bytes(),
+        HOST_MENU_ASSET: patch_update_menu(source_js[HOST_MENU_ASSET]).encode(),
+        UPDATE_MAIN: (ROOT / 'update-checker.cjs').read_bytes(),
     }
-    for key in (SELECTION_ASSET, EARLY, PRELOAD, MAIN):
+    for key in (SELECTION_ASSET, EARLY, PRELOAD, MAIN, HOST_MENU_ASSET, UPDATE_MAIN):
         syntax_file = ROOT / ('patched-' + Path(key).name)
         syntax_file.write_bytes(replacements[key])
         subprocess.run(['node', '--check', str(syntax_file)], check=True)
@@ -222,12 +217,14 @@ def main():
             item['size'] = len(replacements[key])
             item['integrity'] = integrity(replacements[key], item.get('integrity', {}).get('blockSize', 4194304))
         offset += item['size']
-    new_leaf = {'size': len(replacements[MAIN]), 'offset': str(offset),
-                'integrity': integrity(replacements[MAIN])}
     build_files = leaf(tree, '.vite/build')['files']
-    if Path(MAIN).name in build_files:
-        raise SystemExit('Local main bridge already exists in the source archive')
-    build_files[Path(MAIN).name] = new_leaf
+    added_assets = (MAIN, UPDATE_MAIN)
+    for key in added_assets:
+        if Path(key).name in build_files:
+            raise SystemExit('A local module already exists in the source archive')
+        build_files[Path(key).name] = {'size': len(replacements[key]), 'offset': str(offset),
+                                     'integrity': integrity(replacements[key])}
+        offset += len(replacements[key])
     raw = json.dumps(tree, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
     padding = (-len(raw)) % 4
     header = struct.pack('<II', 4 + len(raw) + padding, len(raw)) + raw + bytes(padding)
@@ -245,7 +242,8 @@ def main():
             else:
                 source.seek(body + old_offset)
                 copy_bytes(source, output, old_size)
-        output.write(replacements[MAIN])
+        for key in added_assets:
+            output.write(replacements[key])
     staged.replace(TARGET / RESOURCE)
     info['ElectronAsarIntegrity']['Resources/app.asar']['hash'] = hashlib.sha256(raw).hexdigest()
     info['CFBundleDisplayName'] = 'ChatGPT Read Aloud'
@@ -253,6 +251,8 @@ def main():
     info['CodexReadAloudVoicePickerVersion'] = 1
     info['CodexReadAloudSelectionHighlightVersion'] = 1
     info['CodexReadAloudSkipCodeBlocksVersion'] = 1
+    info['CodexReadAloudSpeechHostAdapterVersion'] = 1
+    info['CodexReadAloudUpdateCheckerVersion'] = 1
     # Avoid registering the experimental copy for the official app's deep links.
     info.pop('CFBundleURLTypes', None)
     info['SUEnableAutomaticChecks'] = False

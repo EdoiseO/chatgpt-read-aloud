@@ -26,6 +26,12 @@ component licenses.
 
 ## Reading behavior
 
+Reading controls sit outside the host's hover-only action group. Completed
+voice-session assistant entries use the same response component and scoped text
+mapper. User messages, empty responses, streaming ordinary replies, and silent
+automation completions remain excluded. The speech host adapter pins the
+reviewed asset and verifies its complete contents after reversing the patch.
+
 Read aloud skips code blocks and continues with the surrounding explanation.
 This applies to whole responses and selected passages. A selection containing
 only a code block produces no speech and never expands to the whole response.
@@ -61,6 +67,19 @@ Activation checks the running process's gate, absence of the loaded Sparkle
 addon, and both cached and on-disk preferences after the 30-second startup check. Failed checks
 enter the existing safe rollback flow. Upgrade through the staged rebuild
 procedure. The official app's updater is independent.
+
+The app menu's **Check for Updates…** now uses a separate read-only checker.
+A pinned menu adapter replaces only the original check action and its visibility
+guard on each menu rebuild. It does not initialize Sparkle. An explicit click
+fetches a bounded public XML feed over HTTPS, filters stable macOS ARM releases,
+and compares numeric build versions. Installed metadata comes from the custom
+bundle. A version/build match identifies a reviewed base adapter, not permission
+to install a downloaded archive. Cross-version installation remains guarded.
+
+Launch registration is reconciled after publication and recovery, before launch.
+Only owned custom-app bundles with the expected profile and verified signatures
+can be retired. Registration checks distinguish launch-disabled backup records
+from enabled candidates. No global database reset or Dock rewrite is performed.
 
 Build and launcher utilities accept scratch stages. Verification uses explicit
 exceptions, including under optimized Python, and reports staged/installed scope.
@@ -111,6 +130,9 @@ The source layout is deliberately small:
 | `build_copy.py`, `asar_integrity.py` | Version-specific patch and integrity-preserving local build |
 | `configure_launcher.py`, `profile-launcher.c` | Native permanent-profile entry point |
 | `updater_policy.py`, `updater_host_gate.py` | Custom updater policy and pinned host support |
+| `update-checker.cjs`, `update_menu_adapter.py` | Manual official-release discovery and pinned menu integration |
+| `speech_host_adapter.py` | Pinned response layout and transcript integration |
+| `launch_registration.py` | Constrained macOS app-registration reconciliation |
 | `install_fresh.py`, `apply_voice_upgrade.py` | Fresh installation and guarded staged updates |
 
 See [screenshot provenance and reproduction](SCREENSHOTS.md) and

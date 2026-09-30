@@ -282,6 +282,29 @@ test('a mixed selection reads only its clipped prose on both sides of code and k
     highlightedProseOnly: true, nativeUnchanged: true, nativeIncludesCode: true, alerts: [] });
 });
 
+test('completed transcript research selection reads table cells and stops cleanly when switching or unmounting', async () => {
+  const value = await isolated('<section data-realtime-handoff-id="fixture"><div id="user">Do not read user words.</div><div class="group"><div id="research" data-selected-text-overlay-target><h2>Research</h2><table><tbody><tr><th>Version</th><th>Result</th></tr><tr><td>One</td><td>Ready.</td></tr><tr><td>Two</td><td>Pending.</td></tr></tbody></table></div></div><div class="group"><div id="other" data-selected-text-overlay-target><p>Another response.</p></div></div></section>', async () => {
+    const f = fixture, root = document.querySelector('#research'), other = document.querySelector('#other');
+    const mounted = f.mount(root), second = f.mount(other), cells = root.querySelectorAll('td');
+    const range = document.createRange(); range.setStart(cells[0].firstChild, 0); range.setEnd(cells[1].firstChild, cells[1].textContent.length);
+    getSelection().removeAllRanges(); getSelection().addRange(range); document.dispatchEvent(new Event('selectionchange'));
+    const menu = f.menu(root, range); f.fire(menu, 'mousedown'); f.fire(menu, 'click'); await f.tick();
+    const request = f.starts[0]; request.resolve(f.chunk(request)); await f.tick(); f.audios[0].playing(); await f.tick();
+    const reading = f.highlighted(), selected = getSelection().toString();
+    f.fire(second.button, 'click', { detail: 0 }); await f.tick();
+    const stoppedFirst = f.cancels.includes(request.id), clearedOnSwitch = f.highlighted() === null;
+    const next = f.starts[1]; next.resolve(f.chunk(next)); await f.tick(); f.audios[1].playing(); await f.tick();
+    const otherReading = f.highlighted(); second.unmount(); mounted.unmount(); await f.tick();
+    return { text: request.text, reading, selected, stoppedFirst, clearedOnSwitch,
+      secondText: next.text, otherReading, finalHighlight: f.highlighted(),
+      stoppedSecond: f.cancels.includes(next.id), selectionRemoved: f.menu(root, range) === null,
+      untouchedUser: document.querySelector('#user').textContent, alerts: f.alerts };
+  });
+  assert.deepEqual(value, { text: 'One Ready.', reading: 'OneReady.', selected: 'One\tReady.',
+    stoppedFirst: true, clearedOnSwitch: true, secondText: 'Another response.', otherReading: 'Another response.',
+    finalHighlight: null, stoppedSecond: true, selectionRemoved: true, untouchedUser: 'Do not read user words.', alerts: [] });
+});
+
 test('root-missing HTML fallback strips code headers and blocks without dropping later prose or inline code', async () => {
   const value = await isolated('', async () => {
     const f = fixture, mounted = f.mount(null, {
