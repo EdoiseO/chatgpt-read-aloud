@@ -5,6 +5,8 @@ import plistlib
 import stat
 import subprocess
 
+from updater_host_gate import verify_host_gate
+
 IDENTITY = 'local.edoise.codex.readaloud'
 KEYS = ('SUEnableAutomaticChecks', 'SUAutomaticallyUpdate', 'SUAllowsAutomaticUpdates')
 STARTUP_KEYS = KEYS[:2]
@@ -14,10 +16,12 @@ DEFAULTS_TIMEOUT_SECONDS = 10
 def validate_bundle_policy(info):
     if info.get('CFBundleIdentifier') != IDENTITY:
         raise RuntimeError('Updater policy applies only to the custom Read Aloud copy.')
-    if type(info.get('CodexReadAloudUpdaterPolicyVersion')) is not int or info['CodexReadAloudUpdaterPolicyVersion'] != 1:
+    if type(info.get('CodexReadAloudUpdaterPolicyVersion')) is not int or info['CodexReadAloudUpdaterPolicyVersion'] != 2:
         raise RuntimeError('The custom updater policy is missing.')
     if any(info.get(key) is not False for key in KEYS):
         raise RuntimeError('The custom app must disable automatic update checks and downloads.')
+    if not isinstance(info.get('LSEnvironment'), dict) or info['LSEnvironment'].get('CODEX_SPARKLE_ENABLED') != 'false':
+        raise RuntimeError('The custom app must disable host updater initialization.')
 
 
 def read_custom_preferences(home=Path.home()):
@@ -47,16 +51,29 @@ def report_update_policy(app, home=Path.home()):
     data = launcher.read_bytes()
     overrides = {key: False if key.encode() in data and b'NO\x00' in data else None for key in STARTUP_KEYS}
     if (type(info.get('CodexReadAloudLauncherVersion')) is not int
-            or info['CodexReadAloudLauncherVersion'] != 2
-            or any(value is not False for value in overrides.values())):
+            or info['CodexReadAloudLauncherVersion'] != 3
+            or any(value is not False for value in overrides.values())
+            or b'CODEX_SPARKLE_ENABLED\x00' not in data or b'false\x00' not in data):
         raise RuntimeError('The native launcher does not enforce the custom updater policy.')
+    host_gate = verify_host_gate(app)
     saved = read_custom_preferences(home)
     conflict = any(saved.get(key) is not None and saved.get(key) is not False for key in STARTUP_KEYS)
-    return {'policyVersion': 1, 'bundleDefaults': {key: info[key] for key in KEYS},
+    return {'policyVersion': 2, 'bundleDefaults': {key: info[key] for key in KEYS},
             'savedPreferences': saved, 'startupOverrides': overrides,
+            'hostUpdaterDisabled': True, 'hostGate': host_gate,
             'automaticChecksDisabled': True, 'automaticDownloadsDisabled': True,
             'preferencesMigrated': all(saved.get(key) is False for key in STARTUP_KEYS),
-            'savedPreferencesConflict': conflict, 'manualUpdatesBlocked': False}
+            'savedPreferencesConflict': conflict, 'manualUpdatesBlocked': True}
+
+
+def verify_effective_preferences(runner=subprocess.run):
+    """Read through CFPreferences so cached changes cannot evade a disk check."""
+    for key in STARTUP_KEYS:
+        result = runner(['/usr/bin/defaults', 'read', IDENTITY, key],
+                        check=True, capture_output=True, text=True, timeout=DEFAULTS_TIMEOUT_SECONDS)
+        if result.returncode or result.stdout.strip() not in ('0', 'false', 'NO'):
+            raise RuntimeError('The custom automatic-update preference remains enabled.')
+    return {key: False for key in STARTUP_KEYS}
 
 
 def migrate_custom_preferences(app, home=Path.home(), runner=subprocess.run):
@@ -71,11 +88,6 @@ def migrate_custom_preferences(app, home=Path.home(), runner=subprocess.run):
                         check=True, capture_output=True, text=True, timeout=DEFAULTS_TIMEOUT_SECONDS)
         if result.returncode:
             raise RuntimeError('The custom updater preference migration failed.')
-    # Read the effective CFPreferences domain through defaults, not its disk cache.
-    for key in STARTUP_KEYS:
-        result = runner(['/usr/bin/defaults', 'read', IDENTITY, key],
-                        check=True, capture_output=True, text=True, timeout=DEFAULTS_TIMEOUT_SECONDS)
-        if result.returncode or result.stdout.strip() not in ('0', 'false', 'NO'):
-            raise RuntimeError('The custom automatic-update preference remains enabled.')
+    verify_effective_preferences(runner)
     return {'customPreferencesMigrated': True, 'automaticChecksDisabled': True,
-            'automaticDownloadsDisabled': True, 'manualUpdatesBlocked': False}
+            'automaticDownloadsDisabled': True, 'hostUpdaterDisabled': True, 'manualUpdatesBlocked': True}

@@ -29,8 +29,8 @@ import time
 
 from asar_integrity import patch_integrity_slot
 from runtime_voices import read_saved_voice
-from updater_policy import migrate_custom_preferences
-from updater_policy import validate_bundle_policy
+from updater_policy import migrate_custom_preferences, report_update_policy
+from updater_policy import validate_bundle_policy, verify_effective_preferences
 
 
 ROOT = Path(__file__).resolve().parent
@@ -148,7 +148,7 @@ def bundle_info(config, bundle, expected_version=None):
     if expected_version is not None and info.get('CFBundleShortVersionString') != expected_version:
         raise RuntimeError('The staged and installed custom-app versions differ.')
     if (type(info.get('CodexReadAloudLauncherVersion')) is not int
-            or info['CodexReadAloudLauncherVersion'] not in (1, 2) or
+            or info['CodexReadAloudLauncherVersion'] not in (1, 2, 3) or
             info.get('LSEnvironment', {}).get('CODEX_ELECTRON_USER_DATA_PATH') != str(config.profile)):
         raise RuntimeError('The custom app is not bound to its existing dedicated profile.')
     for name in ('ChatGPT', 'ChatGPT-native'):
@@ -156,6 +156,52 @@ def bundle_info(config, bundle, expected_version=None):
         if not executable.is_file() or not os.access(executable, os.X_OK):
             raise RuntimeError('The existing native profile launcher is missing.')
     return info
+
+
+def bundle_identity_hash(bundle, asar_header_hash):
+    """Bind launcher/policy changes even when the packed application is unchanged."""
+    if not isinstance(asar_header_hash, str) or re.fullmatch(r'[0-9a-f]{64}', asar_header_hash) is None:
+        raise RuntimeError('The verified archive identity is invalid.')
+    digest = hashlib.sha256(b'codex-read-aloud-bundle-identity-v1\x00')
+    fields = [('Contents/Info.plist', contained_path(bundle, Path('Contents/Info.plist')).read_bytes())]
+    for name in ('ChatGPT', 'ChatGPT-native'):
+        relative = 'Contents/MacOS/' + name
+        fields.append((relative, hashlib.sha256(contained_path(bundle, Path(relative)).read_bytes()).digest()))
+    fields.append(('Contents/Resources/app.asar.header.sha256', bytes.fromhex(asar_header_hash)))
+    for name, value in fields:
+        label = name.encode('utf-8')
+        digest.update(struct.pack('>I', len(label)))
+        digest.update(label)
+        digest.update(struct.pack('>Q', len(value)))
+        digest.update(value)
+    return digest.hexdigest()
+
+
+def validate_transaction_bundle_identities(record):
+    fields = ('previousBundleIdentityHash', 'stagedBundleIdentityHash')
+    if any(field in record for field in fields) and not all(field in record for field in fields):
+        raise RuntimeError('The transaction bundle identity pair is incomplete.')
+    for role in ('previous', 'staged'):
+        field = role + 'BundleIdentityHash'
+        if field in record and (not isinstance(record[field], str)
+                                or re.fullmatch(r'[0-9a-f]{64}', record[field]) is None):
+            raise RuntimeError('The transaction bundle identity is invalid.')
+
+
+def matches_transaction_bundle(info, record, role):
+    validate_transaction_bundle_identities(record)
+    field = role + 'BundleIdentityHash'
+    if field in record:
+        actual, expected = info.get('_bundleIdentityHash'), record[field]
+    else:
+        # Existing journals predate launcher identities. Only an absent field
+        # permits their legacy ASAR comparison; malformed new fields never do.
+        actual = info['ElectronAsarIntegrity']['Resources/app.asar']['hash']
+        expected = record.get(role + 'AsarHeaderHash')
+    if (not isinstance(expected, str) or re.fullmatch(r'[0-9a-f]{64}', expected) is None
+            or not isinstance(actual, str) or re.fullmatch(r'[0-9a-f]{64}', actual) is None):
+        raise RuntimeError('The transaction app identity is missing or invalid.')
+    return actual == expected
 
 
 def verify_bundle(config, bundle, expected_version=None, require_upgrade=False, runner=subprocess.run):
@@ -166,9 +212,13 @@ def verify_bundle(config, bundle, expected_version=None, require_upgrade=False, 
                             or info['CodexReadAloudSelectionHighlightVersion'] != 1):
         raise RuntimeError('The staged app is missing the verified selection-highlight version marker.')
     if require_upgrade:
-        if type(info.get('CodexReadAloudLauncherVersion')) is not int or info['CodexReadAloudLauncherVersion'] != 2:
+        if type(info.get('CodexReadAloudLauncherVersion')) is not int or info['CodexReadAloudLauncherVersion'] != 3:
             raise RuntimeError('The staged app is missing the verified updater-policy launcher.')
         validate_bundle_policy(info)
+        # Markers alone cannot establish that the native wrapper supplies the
+        # host's updater gate or that this exact host build honors the gate.
+        # Saved preference conflicts are migrated only after the app quits.
+        report_update_policy(bundle)
     checked_run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(bundle)], runner)
     framework = contained_path(bundle, Path('Contents/Frameworks/Codex Framework.framework/Versions/Current/Codex Framework'))
     integrity = info['ElectronAsarIntegrity']
@@ -199,6 +249,7 @@ def verify_bundle(config, bundle, expected_version=None, require_upgrade=False, 
             if main_hash != hashlib.sha256((ROOT / 'kokoro-main.cjs').read_bytes()).hexdigest():
                 raise RuntimeError('The staged voice module differs from the current verified source.')
             info['_mainModuleHash'] = main_hash
+    info['_bundleIdentityHash'] = bundle_identity_hash(bundle, integrity['Resources/app.asar']['hash'])
     return info
 
 
@@ -319,6 +370,7 @@ def transaction_record(config, *, strict=False):
             raise RuntimeError('The activation journal identity is invalid.')
         valid_backup_path(config, record.get('backup'))
         retained_backup_paths(config, record)
+        validate_transaction_bundle_identities(record)
         return record
     except (OSError, ValueError, TypeError, UnicodeError, RuntimeError):
         if strict:
@@ -706,6 +758,31 @@ def profile_pid(config, runner=subprocess.run):
     return pid
 
 
+def validate_startup_process(config, pid, runner=subprocess.run):
+    # Read arguments separately so an updater-looking argument cannot stand in
+    # for the inherited environment. Never include other environment values in
+    # a report or error message.
+    command = checked_run(['/bin/ps', 'ww', '-p', str(pid), '-o', 'args='], runner).stdout.strip()
+    combined = checked_run(['/bin/ps', 'eww', '-p', str(pid), '-o', 'command='], runner).stdout.strip()
+    if not command or not combined.startswith(command + ' '):
+        raise RuntimeError('The upgraded process environment could not be verified.')
+    environment = combined[len(command) + 1:]
+    if 'CODEX_ELECTRON_USER_DATA_PATH=' + str(config.profile) not in environment:
+        raise RuntimeError('The upgraded process is missing its dedicated profile environment.')
+    updater_values = re.findall(r'(?:^|\s)CODEX_SPARKLE_ENABLED=([^\s]*)', environment)
+    if updater_values != ['false']:
+        raise RuntimeError('The upgraded process does not disable the host updater.')
+    mappings = checked_run(['/usr/sbin/lsof', '-n', '-P', '-a', '-p', str(pid), '-d', 'txt', '-F', 'n'], runner).stdout
+    native = str(config.target / 'Contents/MacOS/ChatGPT-native')
+    paths = {line[1:] for line in mappings.splitlines() if line.startswith('n')}
+    natives = {path for path in paths if custom_app_path(config, path)
+               and path.endswith('/Contents/MacOS/ChatGPT-native')}
+    if natives != {native}:
+        raise RuntimeError('Startup is not running the upgraded native executable at the current app path.')
+    if any('/Contents/Resources/native/sparkle.node' in path for path in paths):
+        raise RuntimeError('The upgraded process loaded the disabled native updater.')
+
+
 def validate_startup(config, runner=subprocess.run, clock=time.monotonic, sleep=time.sleep):
     deadline = clock() + 20
     pid = None
@@ -716,19 +793,17 @@ def validate_startup(config, runner=subprocess.run, clock=time.monotonic, sleep=
         sleep(0.5)
     if pid is None:
         raise RuntimeError('The upgraded custom app did not start in its dedicated profile.')
-    environment = checked_run(['/bin/ps', 'eww', '-p', str(pid), '-o', 'command='], runner).stdout
-    if 'CODEX_ELECTRON_USER_DATA_PATH=' + str(config.profile) not in environment:
-        raise RuntimeError('The upgraded process is missing its dedicated profile environment.')
-    mappings = checked_run(['/usr/sbin/lsof', '-n', '-P', '-a', '-p', str(pid), '-d', 'txt', '-F', 'n'], runner).stdout
-    native = str(config.target / 'Contents/MacOS/ChatGPT-native')
-    natives = {line[1:] for line in mappings.splitlines() if line.startswith('n')
-               and custom_app_path(config, line[1:]) and line[1:].endswith('/Contents/MacOS/ChatGPT-native')}
-    if natives != {native}:
-        raise RuntimeError('Startup is not running the upgraded native executable at the current app path.')
+    validate_startup_process(config, pid, runner)
     for _ in range(30):
         sleep(1)
         if profile_pid(config, runner) != pid:
             raise RuntimeError('The upgraded app exited during its 30-second startup check.')
+    # Recheck after host initialization: a launcher argument or a freshly
+    # migrated preference does not prove that the running host stayed disabled.
+    validate_startup_process(config, pid, runner)
+    verify_effective_preferences(runner=runner)
+    if report_update_policy(config.target).get('savedPreferencesConflict') is not False:
+        raise RuntimeError('The upgraded app changed its disabled updater preferences during startup.')
     return pid
 
 
@@ -809,9 +884,7 @@ def restore_previous(config, record, previous, wait_seconds, verify, wait, block
         if blockers(config):
             raise RuntimeError('The upgraded app is still running.')
         previous_info = verify(config, previous)
-        expected = record.get('previousAsarHeaderHash')
-        if (not isinstance(expected, str) or re.fullmatch(r'[0-9a-f]{64}', expected) is None
-                or previous_info['ElectronAsarIntegrity']['Resources/app.asar']['hash'] != expected):
+        if not matches_transaction_bundle(previous_info, record, 'previous'):
             raise RuntimeError('The previous app no longer matches the transaction identity.')
         verify(config, config.target)
         exchange(config.target, previous)
@@ -877,10 +950,13 @@ def apply_upgrade(config, wait_seconds=1800, verify=verify_bundle, blockers=proc
                   'transaction': 'atomic_exchange_v1', 'previousAppPath': str(config.target),
                   'previousAsarHeaderHash': installed['ElectronAsarIntegrity']['Resources/app.asar']['hash'],
                   'stagedAsarHeaderHash': staged['ElectronAsarIntegrity']['Resources/app.asar']['hash'],
+                  'previousBundleIdentityHash': installed['_bundleIdentityHash'],
+                  'stagedBundleIdentityHash': staged['_bundleIdentityHash'],
                   'unchangedDockResourceHashes': dock_hashes,
                   'unchangedCuaSubtreeManifest': cua_manifest,
                   'retainedResourceBackupAliases': [str(alias) for alias in retained],
                   'shutdownMethod': 'user quit; GUI/CLI never killed; verified detached native helpers may receive SIGTERM'}
+        validate_transaction_bundle_identities(record)
         atomic_report(config, record)
         try:
             wait(config, wait_seconds, blockers=blockers)
@@ -891,8 +967,8 @@ def apply_upgrade(config, wait_seconds=1800, verify=verify_bundle, blockers=proc
         # more immediately before the native atomic exchange.
         try:
             current_installed, current_staged = preflight(config, verify, runner)
-            if (current_installed['ElectronAsarIntegrity']['Resources/app.asar']['hash'] != record['previousAsarHeaderHash']
-                    or current_staged['ElectronAsarIntegrity']['Resources/app.asar']['hash'] != record['stagedAsarHeaderHash']):
+            if (not matches_transaction_bundle(current_installed, record, 'previous')
+                    or not matches_transaction_bundle(current_staged, record, 'staged')):
                 raise RuntimeError('A verified app bundle changed while waiting; recheck the staged upgrade.')
             if blockers(config):
                 raise RuntimeError('The custom app restarted; no in-use bundle was replaced.')
@@ -946,11 +1022,8 @@ def rollback_saved(config, wait_seconds=1800, verify=verify_bundle,
             raise RuntimeError('There is no pending rollback for this custom app.')
         verify_exchange_capability(exchange)
         backup = valid_backup_path(config, record['backup'])
-        expected = record.get('previousAsarHeaderHash')
-        if not isinstance(expected, str) or re.fullmatch(r'[0-9a-f]{64}', expected) is None:
-            raise RuntimeError('The previous-app identity is missing from the transaction.')
         current = verify(config, config.target)
-        if current['ElectronAsarIntegrity']['Resources/app.asar']['hash'] == expected:
+        if matches_transaction_bundle(current, record, 'previous'):
             # Reverse exchange succeeded, but preserving the failed upgrade was
             # interrupted. The safe old target remains in place throughout.
             failed = Path(record.get('failedUpgradePath', str(backup)))
@@ -972,7 +1045,7 @@ def rollback_saved(config, wait_seconds=1800, verify=verify_bundle,
         for candidate in (config.stage, backup):
             if candidate.exists() and not candidate.is_symlink():
                 info = verify(config, candidate)
-                if info['ElectronAsarIntegrity']['Resources/app.asar']['hash'] == expected:
+                if matches_transaction_bundle(info, record, 'previous'):
                     previous = candidate
                     break
         if previous is None:

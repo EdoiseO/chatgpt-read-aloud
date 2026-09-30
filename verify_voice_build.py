@@ -18,6 +18,7 @@ import subprocess
 from asar_integrity import patch_integrity_slot
 from build_copy import ASSET, SELECTION_ASSET, SELECTION_BUTTON, EARLY, PRELOAD, MAIN, FRAMEWORK, RESOURCE, VERSION
 from runtime_voices import read_saved_voice, supported_voice_ids
+from updater_host_gate import HOST_GATE_ASSETS, validate_host_gate_assets
 
 ROOT = Path(__file__).resolve().parent
 MAX_HEADER_BYTES = 64 * 1024 * 1024
@@ -122,7 +123,7 @@ def verify_archive(path, recorded_hash):
             require(digest.hexdigest() == item['integrity']['hash'], f'ASAR packed asset SHA256 disagrees: {key}')
             require(blocks == item['integrity']['blocks'], f'ASAR packed block hashes disagree: {key}')
             count += 1
-            if key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN):
+            if key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN, *HOST_GATE_ASSETS):
                 require(size <= MAX_HOOK_BYTES, f'ASAR speech hook exceeds the verification limit: {key}')
                 stream.seek(body + offset)
                 try:
@@ -181,24 +182,26 @@ def verify_build(app, *, home=None, official=Path('/Applications/ChatGPT.app'), 
     for marker in ('CodexReadAloudVoicePickerVersion', 'CodexReadAloudSelectionHighlightVersion',
                    'CodexReadAloudSkipCodeBlocksVersion'):
         require(type(info.get(marker)) is int and info[marker] == 1, f'Missing or invalid feature marker: {marker}')
-    require(type(info.get('CodexReadAloudLauncherVersion')) is int and info['CodexReadAloudLauncherVersion'] == 2,
+    require(type(info.get('CodexReadAloudLauncherVersion')) is int and info['CodexReadAloudLauncherVersion'] == 3,
             'Native launcher policy version is missing or invalid')
     require(isinstance(info.get('LSEnvironment'), dict) and
             info['LSEnvironment'].get('CODEX_ELECTRON_USER_DATA_PATH') == str(
                 home / 'Library/Application Support/ChatGPT Read Aloud/user-data'), 'Permanent profile binding disagrees')
-    from updater_policy import report_update_policy, validate_bundle_policy
+    from updater_policy import report_update_policy, validate_bundle_policy, verify_effective_preferences
     validate_bundle_policy(info)
     updater = report_update_policy(app, home=home)
     if scope == 'installed':
         require(updater.get('automaticChecksDisabled') is True and updater.get('automaticDownloadsDisabled') is True
                 and updater.get('savedPreferencesConflict') is False,
                 'Installed custom updater preferences must disable automatic checks and downloads')
+        updater['effectivePreferences'] = verify_effective_preferences(runner)
     for target in (app, official):
         runner(['codesign', '--verify', '--deep', '--strict', str(target)], check=True)
     patch_integrity_slot((app / FRAMEWORK).read_bytes(),
                          info.get('ElectronAsarIntegrity'), info.get('ElectronAsarIntegrity'))
     recorded = info.get('ElectronAsarIntegrity', {}).get('Resources/app.asar', {}).get('hash')
     hooks, count, header_hash = verify_archive(app / RESOURCE, recorded)
+    validate_host_gate_assets({key: value.encode('utf-8') for key, value in hooks.items() if key in HOST_GATE_ASSETS})
     for key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN):
         require(key in hooks, f'Required speech hook asset is missing: {key}')
     require(hooks[EARLY].count('require("./local-read-aloud-main.cjs")') == 1, 'Main bootstrap hook is missing or duplicated')

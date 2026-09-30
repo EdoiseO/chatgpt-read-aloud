@@ -8,44 +8,38 @@ import plistlib
 import shutil
 import subprocess
 import sys
-import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import zipfile
 
+import configure_launcher as launcher
 import runtime_voices as voices
 import updater_policy as policy
+from test_verify_voice_build import fixture as build_fixture
 
 ROOT = Path(__file__).resolve().parent
 
 
 @contextmanager
 def fixture():
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory).resolve()
-        home, app = root / 'home', root / 'ChatGPT Read Aloud.app'
-        home.mkdir()
-        (app / 'Contents/MacOS').mkdir(parents=True)
-        info = {'CFBundleIdentifier': policy.IDENTITY, 'CodexReadAloudUpdaterPolicyVersion': 1,
-                'CodexReadAloudLauncherVersion': 2, **{key: False for key in policy.KEYS}}
-        info_path = app / 'Contents/Info.plist'
-        info_path.write_bytes(plistlib.dumps(info))
-        (app / 'Contents/MacOS/ChatGPT').write_bytes(b'SUEnableAutomaticChecks\0SUAutomaticallyUpdate\0NO\0')
-        prefs = home / 'Library/Preferences' / (policy.IDENTITY + '.plist')
+    with build_fixture() as data:
+        prefs = data.home / 'Library/Preferences' / (policy.IDENTITY + '.plist')
         prefs.parent.mkdir(parents=True)
-        yield SimpleNamespace(root=root, home=home, app=app, info=info, info_path=info_path, prefs=prefs)
+        yield SimpleNamespace(**vars(data), prefs=prefs)
 
 
 class UpdaterPolicyTests(unittest.TestCase):
-    def test_absent_preferences_use_disabled_defaults_and_explicit_manual_update_limit(self):
+    def test_absent_preferences_use_disabled_host_and_defaults_without_writes(self):
         with fixture() as data:
             report = policy.report_update_policy(data.app, data.home)
             self.assertTrue(report['automaticChecksDisabled'])
             self.assertTrue(report['automaticDownloadsDisabled'])
             self.assertFalse(report['savedPreferencesConflict'])
             self.assertFalse(report['preferencesMigrated'])
-            self.assertFalse(report['manualUpdatesBlocked'])
+            self.assertTrue(report['hostUpdaterDisabled'])
+            self.assertTrue(report['manualUpdatesBlocked'])
+            self.assertEqual(report['policyVersion'], 2)
             self.assertEqual(report['startupOverrides'], {key: False for key in policy.STARTUP_KEYS})
             self.assertFalse(data.prefs.exists())
 
@@ -64,8 +58,10 @@ class UpdaterPolicyTests(unittest.TestCase):
         with fixture() as data:
             for key, value in (('CFBundleIdentifier', 'com.openai.chat'),
                                ('CodexReadAloudUpdaterPolicyVersion', True),
-                               ('CodexReadAloudUpdaterPolicyVersion', 1.0),
-                               ('CodexReadAloudLauncherVersion', 2.0),
+                               ('CodexReadAloudUpdaterPolicyVersion', 1),
+                               ('CodexReadAloudUpdaterPolicyVersion', 2.0),
+                               ('CodexReadAloudLauncherVersion', 2),
+                               ('CodexReadAloudLauncherVersion', 3.0),
                                *[(key, value) for key in policy.KEYS for value in (True, 0, 'NO')]):
                 with self.subTest(key=key, value=value):
                     changed = dict(data.info)
@@ -84,10 +80,23 @@ class UpdaterPolicyTests(unittest.TestCase):
         with fixture() as data:
             launcher = data.app / 'Contents/MacOS/ChatGPT'
             for content in (b'NO\0', b'SUEnableAutomaticChecks\0NO\0',
-                            b'SUEnableAutomaticChecks\0SUAutomaticallyUpdate\0YES\0'):
+                            b'SUEnableAutomaticChecks\0SUAutomaticallyUpdate\0YES\0',
+                            b'SUEnableAutomaticChecks\0SUAutomaticallyUpdate\0NO\0',
+                            b'SUEnableAutomaticChecks\0SUAutomaticallyUpdate\0NO\0CODEX_SPARKLE_ENABLED\0true\0'):
                 launcher.write_bytes(content)
                 with self.assertRaisesRegex(RuntimeError, 'native launcher'):
                     policy.report_update_policy(data.app, data.home)
+
+    def test_bundle_host_gate_requires_exact_false_string(self):
+        with fixture() as data:
+            for environment in ({}, {'CODEX_SPARKLE_ENABLED': True},
+                                {'CODEX_SPARKLE_ENABLED': False}, {'CODEX_SPARKLE_ENABLED': 'true'},
+                                {'CODEX_SPARKLE_ENABLED': '0'}, {'CODEX_SPARKLE_ENABLED': ''},
+                                {'CODEX_SPARKLE_ENABLED': 'False'}, 'false'):
+                with self.subTest(environment=environment):
+                    data.info_path.write_bytes(plistlib.dumps({**data.info, 'LSEnvironment': environment}))
+                    with self.assertRaisesRegex(RuntimeError, 'host updater initialization'):
+                        policy.report_update_policy(data.app, data.home)
 
     def test_invalid_or_symlinked_preference_files_reject_without_change(self):
         with fixture() as data:
@@ -125,7 +134,7 @@ class UpdaterPolicyTests(unittest.TestCase):
             with patch.object(policy, 'report_update_policy', return_value={}):
                 result = policy.migrate_custom_preferences(data.app, home=Path.home(), runner=runner)
             self.assertTrue(result['customPreferencesMigrated'])
-            self.assertFalse(result['manualUpdatesBlocked'])
+            self.assertTrue(result['manualUpdatesBlocked'])
             self.assertEqual(calls, [
                 ['/usr/bin/defaults', 'write', policy.IDENTITY, key, '-bool', 'false'] for key in policy.STARTUP_KEYS
             ] + [['/usr/bin/defaults', 'read', policy.IDENTITY, key] for key in policy.STARTUP_KEYS])
@@ -231,9 +240,58 @@ class RuntimeVoicePolicyTests(unittest.TestCase):
                 voices.read_saved_voice(runtime, supported)
 
 
+class ConfigureLauncherPolicyTests(unittest.TestCase):
+    def configure(self, data, *, refresh):
+        commands = []
+        def runner(arguments, **_kwargs):
+            commands.append(arguments)
+            if arguments[0] == 'xcrun':
+                Path(arguments[-1]).write_bytes(b'fixture compiled launcher')
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        profile = data.runtime.parent / 'user-data'
+        with patch.object(launcher.subprocess, 'run', side_effect=runner), patch('builtins.print'):
+            launcher.main(data.app, profile=profile, refresh_launcher=refresh)
+        info = plistlib.loads(data.info_path.read_bytes())
+        self.assertEqual(info['CodexReadAloudLauncherVersion'], 3)
+        self.assertEqual(info['CodexReadAloudUpdaterPolicyVersion'], 2)
+        self.assertEqual(info['LSEnvironment']['CODEX_SPARKLE_ENABLED'], 'false')
+        self.assertEqual(info['LSEnvironment']['CODEX_ELECTRON_USER_DATA_PATH'], str(profile))
+        self.assertFalse(any('lsregister' in str(argument) for arguments in commands for argument in arguments))
+        return info
+
+    def test_fresh_launcher_supplies_host_gate_and_preserves_native_executable(self):
+        with fixture() as data:
+            main = data.app / 'Contents/MacOS/ChatGPT'
+            native = main.with_name('ChatGPT-native')
+            native.unlink()
+            main.write_bytes(b'fixture original native executable')
+            info = dict(data.info)
+            info.pop('CodexReadAloudLauncherVersion')
+            info.pop('CodexReadAloudUpdaterPolicyVersion')
+            info.pop('LSEnvironment')
+            data.info_path.write_bytes(plistlib.dumps(info))
+            self.configure(data, refresh=False)
+            self.assertEqual(native.read_bytes(), b'fixture original native executable')
+            self.assertEqual(main.read_bytes(), b'fixture compiled launcher')
+
+    def test_refresh_accepts_versions_one_two_three_and_replaces_conflicting_gate(self):
+        for version in (1, 2, 3):
+            with self.subTest(version=version), fixture() as data:
+                native = data.app / 'Contents/MacOS/ChatGPT-native'
+                native_before = native.read_bytes()
+                info = dict(data.info)
+                info['CodexReadAloudLauncherVersion'] = version
+                info['LSEnvironment'] = {**info['LSEnvironment'],
+                    'CODEX_SPARKLE_ENABLED': 'true', 'UNRELATED_SETTING': 'preserved'}
+                data.info_path.write_bytes(plistlib.dumps(info))
+                configured = self.configure(data, refresh=True)
+                self.assertEqual(configured['LSEnvironment']['UNRELATED_SETTING'], 'preserved')
+                self.assertEqual(native.read_bytes(), native_before)
+
+
 @unittest.skipUnless(sys.platform == 'darwin' and shutil.which('xcrun'), 'Native macOS compiler required')
 class NativeLauncherPolicyTests(unittest.TestCase):
-    def test_argument_domain_overrides_old_values_and_incoming_flags_are_filtered(self):
+    def test_host_gate_overrides_inherited_values_and_preserves_profile_and_arguments(self):
         with fixture() as data:
             profile = data.root / 'dedicated-profile'
             main = data.app / 'Contents/MacOS/ChatGPT'
@@ -247,7 +305,9 @@ class NativeLauncherPolicyTests(unittest.TestCase):
                     NSMutableArray *args = [NSMutableArray array];
                     for (int i=1;i<argc;i++) [args addObject:[NSString stringWithUTF8String:argv[i]]];
                     const char *profile = getenv("CODEX_ELECTRON_USER_DATA_PATH");
+                    const char *sparkle = getenv("CODEX_SPARKLE_ENABLED");
                     NSDictionary *result = @{@"args":args,@"profile":profile?[NSString stringWithUTF8String:profile]:@"",
+                        @"sparkleEnabled":sparkle?[NSString stringWithUTF8String:sparkle]:@"<unset>",
                         @"argumentDomain":[defaults volatileDomainForName:NSArgumentDomain],
                         @"automaticChecks":@([defaults boolForKey:@"SUEnableAutomaticChecks"]),
                         @"automaticUpdates":@([defaults boolForKey:@"SUAutomaticallyUpdate"])};
@@ -262,15 +322,24 @@ class NativeLauncherPolicyTests(unittest.TestCase):
             incoming = ['--user-data-dir=/wrong', '--user-data-dir', '/also-wrong',
                         '-SUEnableAutomaticChecks', 'YES', '-SUAutomaticallyUpdate=YES',
                         '-SUEnableAutomaticChecks=1', '-SUAutomaticallyUpdate', 'YES', '--fixture-option', 'keep']
-            output = subprocess.run([str(main), *incoming], check=True, capture_output=True, text=True, timeout=5)
-            result = json.loads(output.stdout)
-            self.assertEqual(result['profile'], str(profile))
-            self.assertEqual(result['args'], ['--user-data-dir=' + str(profile),
-                '-SUEnableAutomaticChecks', 'NO', '-SUAutomaticallyUpdate', 'NO', '--fixture-option', 'keep'])
-            self.assertFalse(result['automaticChecks'])
-            self.assertFalse(result['automaticUpdates'])
-            self.assertEqual(result['argumentDomain']['SUEnableAutomaticChecks'], 'NO')
-            self.assertEqual(result['argumentDomain']['SUAutomaticallyUpdate'], 'NO')
+            for inherited in (None, 'true', '1', '', 'false'):
+                with self.subTest(inherited=inherited):
+                    environment = {**os.environ, 'CODEX_ELECTRON_USER_DATA_PATH': '/inherited/wrong-profile'}
+                    if inherited is None:
+                        environment.pop('CODEX_SPARKLE_ENABLED', None)
+                    else:
+                        environment['CODEX_SPARKLE_ENABLED'] = inherited
+                    output = subprocess.run([str(main), *incoming], env=environment,
+                                            check=True, capture_output=True, text=True, timeout=5)
+                    result = json.loads(output.stdout)
+                    self.assertEqual(result['sparkleEnabled'], 'false')
+                    self.assertEqual(result['profile'], str(profile))
+                    self.assertEqual(result['args'], ['--user-data-dir=' + str(profile),
+                        '-SUEnableAutomaticChecks', 'NO', '-SUAutomaticallyUpdate', 'NO', '--fixture-option', 'keep'])
+                    self.assertFalse(result['automaticChecks'])
+                    self.assertFalse(result['automaticUpdates'])
+                    self.assertEqual(result['argumentDomain']['SUEnableAutomaticChecks'], 'NO')
+                    self.assertEqual(result['argumentDomain']['SUAutomaticallyUpdate'], 'NO')
 
 
 if __name__ == '__main__':

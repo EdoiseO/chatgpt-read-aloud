@@ -27,6 +27,23 @@ def successful_runner(arguments, **kwargs):
     return SimpleNamespace(returncode=0, stdout='', stderr='')
 
 
+def startup_runner(config, *, environment='CODEX_SPARKLE_ENABLED=false', command_suffix='', mappings=()):
+    config.profile.mkdir(parents=True, exist_ok=True)
+    (config.profile / 'SingletonLock').symlink_to('fixture-host-4242')
+    command = f'{config.target}/Contents/MacOS/ChatGPT-native --user-data-dir={config.profile}' + command_suffix
+    def runner(args, **kwargs):
+        output = command
+        if 'eww' in args:
+            extra = environment() if callable(environment) else environment
+            output += ' CODEX_ELECTRON_USER_DATA_PATH=' + str(config.profile) + ' ' + extra
+        if args[0] == '/usr/sbin/lsof':
+            extra = mappings() if callable(mappings) else mappings
+            output = ''.join('n' + str(path) + '\n' for path in
+                             (config.target / 'Contents/MacOS/ChatGPT-native', *extra))
+        return SimpleNamespace(returncode=0, stdout=output, stderr='')
+    return runner
+
+
 @contextmanager
 def fixture():
     with tempfile.TemporaryDirectory() as folder:
@@ -63,7 +80,12 @@ def fixture():
         with patch.object(runtime_voices, 'supported_voice_ids',
                           return_value=frozenset(('af_aoede', 'af_bella', 'af_heart'))), \
                 patch.object(upgrade, 'migrate_update_policy',
-                             return_value={'customPreferencesMigrated': True}):
+                             return_value={'customPreferencesMigrated': True}), \
+                patch.object(upgrade, 'verify_effective_preferences', return_value={
+                    'SUEnableAutomaticChecks': False, 'SUAutomaticallyUpdate': False}), \
+                patch.object(upgrade, 'report_update_policy', return_value={
+                    'hostUpdaterDisabled': True, 'savedPreferencesConflict': False,
+                    'manualUpdatesBlocked': True}):
             yield config
 
 
@@ -73,11 +95,13 @@ def fake_verify(config, bundle, version=None, require_upgrade=False):
     if version is not None and version != 'test-version':
         raise RuntimeError('Mismatched version')
     return {'CFBundleShortVersionString': 'test-version', 'CFBundleIdentifier': upgrade.IDENTITY,
-            'CodexReadAloudLauncherVersion': 2, 'CodexReadAloudUpdaterPolicyVersion': 1,
+            'CodexReadAloudLauncherVersion': 3, 'CodexReadAloudUpdaterPolicyVersion': 2,
+            'LSEnvironment': {'CODEX_ELECTRON_USER_DATA_PATH': str(config.profile), 'CODEX_SPARKLE_ENABLED': 'false'},
             'SUEnableAutomaticChecks': False, 'SUAutomaticallyUpdate': False, 'SUAllowsAutomaticUpdates': False,
             'CodexReadAloudVoicePickerVersion': 1,
             'CodexReadAloudSelectionHighlightVersion': 1,
             'ElectronAsarIntegrity': {'Resources/app.asar': {'hash': {'old': OLD_HEADER_HASH, 'newer': 'e' * 64}.get((bundle / 'marker').read_text(), HEADER_HASH)}},
+            '_bundleIdentityHash': hashlib.sha256(b'fixture-bundle:' + (bundle / 'marker').read_bytes()).hexdigest(),
             '_mainModuleHash': MAIN_HASH}
 
 
@@ -155,6 +179,8 @@ def atomic_record(config):
               'backup': str(backup), 'transaction': 'atomic_exchange_v1', 'status': 'exchanged',
               'previousAppPath': str(config.stage), 'previousAsarHeaderHash': OLD_HEADER_HASH,
               'stagedAsarHeaderHash': HEADER_HASH,
+              'previousBundleIdentityHash': fake_verify(config, config.target)['_bundleIdentityHash'],
+              'stagedBundleIdentityHash': fake_verify(config, config.stage)['_bundleIdentityHash'],
               'unchangedCuaSubtreeManifest': upgrade.unchanged_cua_proof(config)[0],
               'unchangedDockResourceHashes': upgrade.unchanged_dock_hashes(config)}
     upgrade.atomic_report(config, record)
@@ -211,6 +237,95 @@ class ActivationTests(unittest.TestCase):
             self.assertEqual((config.official / 'marker').read_text(), 'official-unchanged')
             self.assertEqual(launches, [config.target])
             self.assertEqual(config.report.stat().st_mode & 0o777, 0o600)
+            self.assertNotEqual(record['previousBundleIdentityHash'], record['stagedBundleIdentityHash'])
+
+    def test_bundle_identity_binds_policy_and_native_entries_independently_of_archive(self):
+        with fixture() as config:
+            files = {'Contents/Info.plist': b'original-info',
+                     'Contents/MacOS/ChatGPT': b'original-launcher',
+                     'Contents/MacOS/ChatGPT-native': b'original-native'}
+            for relative, data in files.items():
+                path = config.target / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            original = upgrade.bundle_identity_hash(config.target, HEADER_HASH)
+            copy = config.target.with_name('Identical Copy.app')
+            shutil.copytree(config.target, copy)
+            self.assertEqual(upgrade.bundle_identity_hash(copy, HEADER_HASH), original)
+            self.assertRegex(original, r'^[0-9a-f]{64}$')
+            for relative, data in files.items():
+                with self.subTest(relative=relative):
+                    (config.target / relative).write_bytes(data + b'-changed')
+                    self.assertNotEqual(upgrade.bundle_identity_hash(config.target, HEADER_HASH), original)
+                    (config.target / relative).write_bytes(data)
+            self.assertNotEqual(upgrade.bundle_identity_hash(config.target, OLD_HEADER_HASH), original)
+
+    def test_pending_rollback_distinguishes_launcher_only_upgrade_with_identical_archive(self):
+        with fixture() as config:
+            record, backup = atomic_record(config)
+            record.update(previousAsarHeaderHash=HEADER_HASH, stagedAsarHeaderHash=HEADER_HASH,
+                          status='rollback_pending_quit', previousAppPath=str(backup))
+            upgrade.atomic_exchange(config.target, config.stage)
+            config.stage.rename(backup)
+            upgrade.atomic_report(config, record)
+            def equal_archive_verify(*args, **kwargs):
+                info = fake_verify(*args, **kwargs)
+                info['ElectronAsarIntegrity']['Resources/app.asar']['hash'] = HEADER_HASH
+                return info
+            exchanges = []
+            def exchange(left, right):
+                if left == config.target:
+                    exchanges.append((left, right))
+                upgrade.atomic_exchange(left, right)
+            upgrade.rollback_saved(config, verify=equal_archive_verify, wait=no_wait,
+                                   blockers=lambda _: [], launch=lambda _: None, exchange=exchange)
+            self.assertEqual(exchanges, [(config.target, backup)], 'The old wrapper must actually be restored')
+            self.assertEqual((config.target / 'marker').read_text(), 'old')
+            self.assertEqual((config.stage / 'marker').read_text(), 'new')
+            self.assertEqual(json.loads(config.report.read_text())['status'], 'rolled_back')
+
+    def test_invalid_new_transaction_identity_never_uses_legacy_archive_fallback(self):
+        for field in ('previousBundleIdentityHash', 'stagedBundleIdentityHash'):
+            for value in (None, '', 1, False, 'x' * 64, 'A' * 64, 'a' * 63):
+                with self.subTest(field=field, value=value), fixture() as config:
+                    record, _ = atomic_record(config)
+                    record[field] = value
+                    upgrade.atomic_report(config, record)
+                    before = config.report.read_bytes()
+                    with self.assertRaisesRegex(RuntimeError, 'journal is invalid'):
+                        upgrade.rollback_saved(config, verify=fake_verify, wait=no_wait, blockers=lambda _: [],
+                            exchange=lambda *_: self.fail('Invalid identity cannot exchange bundles'),
+                            launch=lambda _: self.fail('Invalid identity cannot launch'))
+                    self.assertEqual(config.report.read_bytes(), before)
+                    self.assertEqual((config.target / 'marker').read_text(), 'old')
+
+    def test_partial_bundle_identity_pair_cannot_fall_back_to_equal_archive(self):
+        for missing in ('previousBundleIdentityHash', 'stagedBundleIdentityHash'):
+            with self.subTest(missing=missing), fixture() as config:
+                record, _ = atomic_record(config)
+                del record[missing]
+                record['stagedAsarHeaderHash'] = record['previousAsarHeaderHash']
+                upgrade.atomic_report(config, record)
+                before = config.report.read_bytes()
+                with self.assertRaisesRegex(RuntimeError, 'journal is invalid'):
+                    upgrade.rollback_saved(config, verify=fake_verify, wait=no_wait, blockers=lambda _: [],
+                        exchange=lambda *_: self.fail('Partial identity cannot exchange bundles'),
+                        launch=lambda _: self.fail('Partial identity cannot launch'))
+                self.assertEqual(config.report.read_bytes(), before)
+                self.assertEqual((config.target / 'marker').read_text(), 'old')
+
+    def test_legacy_journal_without_bundle_identity_fields_still_recovers(self):
+        with fixture() as config:
+            record, backup = atomic_record(config)
+            del record['previousBundleIdentityHash'], record['stagedBundleIdentityHash']
+            upgrade.atomic_exchange(config.target, config.stage)
+            config.stage.rename(backup)
+            record.update(status='rollback_pending_quit', previousAppPath=str(backup))
+            upgrade.atomic_report(config, record)
+            upgrade.rollback_saved(config, verify=fake_verify, wait=no_wait,
+                                   blockers=lambda _: [], launch=lambda _: None)
+            self.assertEqual((config.target / 'marker').read_text(), 'old')
+            self.assertEqual((config.stage / 'marker').read_text(), 'new')
 
     def test_new_valid_stage_cannot_replace_any_pending_recovery_journal(self):
         for status in sorted(upgrade.RECOVERY_STATES):
@@ -518,20 +633,76 @@ class ActivationTests(unittest.TestCase):
 
     def test_startup_verifies_native_profile_environment_and_survives_thirty_seconds(self):
         with fixture() as config:
-            config.profile.mkdir(parents=True)
-            (config.profile / 'SingletonLock').symlink_to('fixture-host-4242')
-            command = f'{config.target}/Contents/MacOS/ChatGPT-native --user-data-dir={config.profile}'
-            def runner(args, **kwargs):
-                output = command
-                if 'eww' in args:
-                    output += ' CODEX_ELECTRON_USER_DATA_PATH=' + str(config.profile)
-                if args[0] == '/usr/sbin/lsof':
-                    output = 'n' + str(config.target / 'Contents/MacOS/ChatGPT-native') + '\n'
-                return SimpleNamespace(returncode=0, stdout=output, stderr='')
             sleeps = []
+            runner = startup_runner(config)
+            effective = upgrade.verify_effective_preferences
+            effective.side_effect = lambda **_: self.assertEqual(sleeps, [1] * 30) or {
+                'SUEnableAutomaticChecks': False, 'SUAutomaticallyUpdate': False}
+            policy = upgrade.report_update_policy
+            def report(_):
+                self.assertEqual(sleeps, [1] * 30)
+                effective.assert_called_once_with(runner=runner)
+                return {'savedPreferencesConflict': False}
+            policy.side_effect = report
             pid = upgrade.validate_startup(config, runner, clock=lambda: 0, sleep=sleeps.append)
             self.assertEqual(pid, 4242)
             self.assertEqual(sleeps, [1] * 30)
+            policy.assert_called_once_with(config.target)
+
+    def test_startup_requires_exact_disabled_host_updater_environment(self):
+        for environment in ('', 'CODEX_SPARKLE_ENABLED=true', 'CODEX_SPARKLE_ENABLED=False',
+                            'CODEX_SPARKLE_ENABLED=false-ish', 'OTHER_CODEX_SPARKLE_ENABLED=false',
+                            'CODEX_SPARKLE_ENABLED=false CODEX_SPARKLE_ENABLED=true'):
+            with self.subTest(environment=environment), fixture() as config:
+                runner = startup_runner(config, environment=environment,
+                                        command_suffix=' CODEX_SPARKLE_ENABLED=false')
+                with self.assertRaisesRegex(RuntimeError, 'does not disable the host updater'):
+                    upgrade.validate_startup(config, runner, clock=lambda: 0, sleep=lambda _: None)
+                upgrade.report_update_policy.assert_not_called()
+
+    def test_startup_rechecks_environment_and_native_updater_after_thirty_seconds(self):
+        for changed in ('environment', 'addon'):
+            with self.subTest(changed=changed), fixture() as config:
+                sleeps = []
+                def environment():
+                    return 'CODEX_SPARKLE_ENABLED=' + ('true' if changed == 'environment' and len(sleeps) == 30 else 'false')
+                def mappings():
+                    return (config.target / 'Contents/Resources/native/sparkle.node',) if changed == 'addon' and len(sleeps) == 30 else ()
+                runner = startup_runner(config, environment=environment, mappings=mappings)
+                with self.assertRaisesRegex(RuntimeError, 'host updater|disabled native updater'):
+                    upgrade.validate_startup(config, runner, clock=lambda: 0, sleep=sleeps.append)
+                self.assertEqual(sleeps, [1] * 30)
+                upgrade.report_update_policy.assert_not_called()
+
+    def test_startup_rejects_native_updater_mapped_before_survival_check(self):
+        with fixture() as config:
+            runner = startup_runner(config, mappings=(config.target / 'Contents/Resources/native/sparkle.node',))
+            with self.assertRaisesRegex(RuntimeError, 'loaded the disabled native updater'):
+                upgrade.validate_startup(config, runner, clock=lambda: 0, sleep=lambda _: self.fail('No startup wait'))
+
+    def test_post_launch_preference_drift_prevents_activation_and_restores_when_safe(self):
+        for failure in ('disk', 'effective'):
+            with self.subTest(failure=failure), fixture() as config:
+                runner = startup_runner(config)
+                sleeps, launches = [], []
+                if failure == 'disk':
+                    upgrade.report_update_policy.return_value = {'savedPreferencesConflict': True}
+                else:
+                    upgrade.verify_effective_preferences.side_effect = RuntimeError('Effective updater preference drift')
+                def startup(cfg):
+                    return upgrade.validate_startup(cfg, runner, clock=lambda: 0, sleep=sleeps.append)
+                with self.assertRaisesRegex(RuntimeError, 'previous app was restored'):
+                    upgrade.apply_upgrade(config, verify=fake_verify, blockers=lambda _: [], wait=no_wait,
+                        runner=successful_runner, launch=lambda _: launches.append(True), startup=startup)
+                self.assertEqual(sleeps, [1] * 30)
+                upgrade.verify_effective_preferences.assert_called_once_with(runner=runner)
+                if failure == 'effective':
+                    upgrade.report_update_policy.assert_not_called()
+                self.assertEqual(len(launches), 2)
+                self.assertEqual(json.loads(config.report.read_text())['status'], 'rolled_back')
+                self.assertFalse(json.loads(config.report.read_text())['startupPassed30Seconds'])
+                self.assertEqual((config.target / 'marker').read_text(), 'old')
+                self.assertEqual((config.stage / 'marker').read_text(), 'new')
 
     def test_bundle_identity_profile_and_containment_are_guarded_without_signing(self):
         with fixture() as config:
@@ -545,7 +716,11 @@ class ActivationTests(unittest.TestCase):
                         'CFBundleShortVersionString': 'test-version', 'CodexReadAloudLauncherVersion': 1,
                         'LSEnvironment': {'CODEX_ELECTRON_USER_DATA_PATH': str(config.profile)}}
                 (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
-            self.assertEqual(upgrade.bundle_info(config, config.target)['CFBundleIdentifier'], upgrade.IDENTITY)
+            for marker in (1, 2, 3):
+                info['CodexReadAloudLauncherVersion'] = marker
+                (config.target / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
+                self.assertEqual(upgrade.bundle_info(config, config.target)['CFBundleIdentifier'], upgrade.IDENTITY,
+                                 'Previous supported launchers must remain valid rollback targets')
             with self.assertRaisesRegex(RuntimeError, 'voice-picker version'):
                 upgrade.verify_bundle(config, config.stage, 'test-version', True)
             executable = config.target / 'Contents/MacOS/ChatGPT-native'
@@ -784,8 +959,8 @@ class ActivationTests(unittest.TestCase):
         with fixture() as config:
             ready = fake_verify(config, config.stage)
             cases = [( {'CodexReadAloudLauncherVersion': marker}, 'updater-policy launcher')
-                     for marker in (None, 1, '2', True)]
-            cases += [({'CodexReadAloudUpdaterPolicyVersion': None}, 'updater policy')]
+                     for marker in (None, 1, 2, '3', True)]
+            cases += [({'CodexReadAloudUpdaterPolicyVersion': marker}, 'updater policy') for marker in (None, 1)]
             cases += [({key: value}, 'disable automatic update')
                       for key in ('SUEnableAutomaticChecks', 'SUAutomaticallyUpdate', 'SUAllowsAutomaticUpdates')
                       for value in (None, True, 0, 'false')]
@@ -794,6 +969,15 @@ class ActivationTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, message):
                         upgrade.verify_bundle(config, config.stage, 'test-version', True,
                                               runner=successful_runner)
+
+    def test_stage_requires_wrapper_and_exact_host_gate_evidence_beyond_policy_markers(self):
+        with fixture() as config:
+            ready = fake_verify(config, config.stage)
+            with patch.object(upgrade, 'bundle_info', return_value=ready), \
+                    patch.object(upgrade, 'report_update_policy', side_effect=RuntimeError('Host updater gate proof failed')) as report:
+                with self.assertRaisesRegex(RuntimeError, 'Host updater gate proof failed'):
+                    upgrade.verify_bundle(config, config.stage, 'test-version', True, runner=successful_runner)
+                report.assert_called_once_with(config.stage)
 
     def test_sentence_worker_report_requires_exact_path_and_valid_matching_hash(self):
         with fixture() as config:
@@ -1290,7 +1474,7 @@ class ActivationTests(unittest.TestCase):
             def runner(args, **kwargs):
                 output = command
                 if 'eww' in args:
-                    output += ' CODEX_ELECTRON_USER_DATA_PATH=' + str(config.profile)
+                    output += ' CODEX_ELECTRON_USER_DATA_PATH=' + str(config.profile) + ' CODEX_SPARKLE_ENABLED=false'
                 if args[0] == '/usr/sbin/lsof':
                     output = 'n' + str(config.stage / 'Contents/MacOS/ChatGPT-native') + '\n'
                 return SimpleNamespace(returncode=0, stdout=output, stderr='')
@@ -1377,6 +1561,30 @@ class ActivationTests(unittest.TestCase):
                                           launch=lambda _: self.fail('No launch'))
                 self.assertEqual(swaps, [])
                 self.assertEqual(json.loads(config.report.read_text())['status'], 'recheck_failed')
+                self.assertEqual((config.target / 'marker').read_text(), 'newer' if changed == 'installed' else 'old')
+                self.assertEqual((config.stage / 'marker').read_text(), 'newer' if changed == 'staged' else 'new')
+
+    def test_launcher_only_change_while_waiting_aborts_even_when_archive_is_identical(self):
+        for changed in ('installed', 'staged'):
+            with self.subTest(changed=changed), fixture() as config:
+                def equal_archive_verify(*args, **kwargs):
+                    info = fake_verify(*args, **kwargs)
+                    info['ElectronAsarIntegrity']['Resources/app.asar']['hash'] = HEADER_HASH
+                    return info
+                def wait(cfg, timeout, blockers):
+                    bundle = cfg.target if changed == 'installed' else cfg.stage
+                    (bundle / 'marker').write_text('newer')
+                def exchange(left, right):
+                    if left == config.target:
+                        self.fail('A changed wrapper must fail before publication')
+                    upgrade.atomic_exchange(left, right)
+                with self.assertRaisesRegex(RuntimeError, 'changed while waiting'):
+                    upgrade.apply_upgrade(config, verify=equal_archive_verify, blockers=lambda _: [], wait=wait,
+                        runner=successful_runner, exchange=exchange, launch=lambda _: self.fail('No launch'))
+                record = json.loads(config.report.read_text())
+                self.assertEqual(record['status'], 'recheck_failed')
+                self.assertEqual(record['previousAsarHeaderHash'], record['stagedAsarHeaderHash'])
+                self.assertNotEqual(record['previousBundleIdentityHash'], record['stagedBundleIdentityHash'])
                 self.assertEqual((config.target / 'marker').read_text(), 'newer' if changed == 'installed' else 'old')
                 self.assertEqual((config.stage / 'marker').read_text(), 'newer' if changed == 'staged' else 'new')
 

@@ -49,16 +49,26 @@ highlight offsets preserved.
 
 ## Update and recovery controls
 
-The custom bundle disallows automatic downloads, and its native launcher sets
-both automatic checks and downloads off in the macOS argument preferences domain.
-Activation also migrates those two saved preferences in the custom bundle's
-domain after quit. The official app's updater is independent. These controls do
-not block a manual upstream update; use the supported staged rebuild procedure.
+The native launcher forces `CODEX_SPARKLE_ENABLED=false` before starting the host.
+This host gate disables Sparkle initialization, including manual in-app updates.
+The builder and verifier pin the two host modules that implement and apply the
+gate; a changed host requires another compatibility review. Bundle defaults,
+startup preference arguments, and migration of the custom domain after quit
+remain additional controls. Sparkle's native startup setter overrides ordinary
+preferences, so those preferences alone cannot enforce the policy.
+
+Activation checks the running process's gate, absence of the loaded Sparkle
+addon, and both cached and on-disk preferences after the 30-second startup check. Failed checks
+enter the existing safe rollback flow. Upgrade through the staged rebuild
+procedure. The official app's updater is independent.
 
 Build and launcher utilities accept scratch stages. Verification uses explicit
 exceptions, including under optimized Python, and reports staged/installed scope.
 Unresolved or invalid recovery journals block a new activation; missing journals
-are distinct from malformed ones. A valid voice change while waiting is retained
+are distinct from malformed ones. New transactions bind recovery to bundle
+metadata, both launch executables, and the archive header so launcher-only
+upgrades remain distinguishable. Legacy journals retain their original archive
+identity checks. A valid voice change while waiting is retained
 and validated against the pinned voice bank, rather than a stale report snapshot.
 
 ## Development and verification
@@ -100,6 +110,7 @@ The source layout is deliberately small:
 | `setup_runtime.py`, `runtime/` | Pinned dependency and model setup |
 | `build_copy.py`, `asar_integrity.py` | Version-specific patch and integrity-preserving local build |
 | `configure_launcher.py`, `profile-launcher.c` | Native permanent-profile entry point |
+| `updater_policy.py`, `updater_host_gate.py` | Custom updater policy and pinned host support |
 | `install_fresh.py`, `apply_voice_upgrade.py` | Fresh installation and guarded staged updates |
 
 See [screenshot provenance and reproduction](SCREENSHOTS.md) and

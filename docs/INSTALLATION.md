@@ -229,10 +229,12 @@ Unresolved, unreadable, or invalid recovery journals block a new activation.
 Complete recorded recovery before preparing another transaction.
 
 After quit and before publication, activation disables the custom copy's saved
-automatic update checks/downloads. Bundle policy and native startup arguments
-enforce this restriction on reopen. Manual upstream updates remain unsupported:
-these controls do not block a user-initiated install. The official app's settings
-are untouched. Inspect `updaterPolicy` in the verification report.
+automatic update checks/downloads. The launcher also forces the host's updater
+switch off before startup. This blocks automatic and manual in-app updates;
+use this staged rebuild procedure to upgrade the custom copy. Activation checks
+the switch, absence of the loaded Sparkle addon, and saved preferences again
+after launch. The official app's settings are untouched. Inspect `updaterPolicy`
+in the verification report.
 
 If rollback is pending after a failed upgraded launch, inspect the report and
 quit the custom app normally before using the installer's documented recovery:

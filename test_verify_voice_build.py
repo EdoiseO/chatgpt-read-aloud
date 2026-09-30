@@ -18,6 +18,7 @@ import zipfile
 import asar_integrity
 import configure_launcher as launcher
 import verify_voice_build as verify
+from updater_host_gate import HOST_GATE_ASSETS, HOST_GATE_ANCHORS
 
 
 def write_archive(path, files, change=None):
@@ -87,31 +88,37 @@ def fixture():
                  verify.EARLY: b'require("./local-read-aloud-main.cjs");',
                  verify.PRELOAD: b'exposeInMainWorld("codexLocalReadAloud" /* sentenceRanges */',
                  verify.MAIN: contents['kokoro-main.cjs'].encode()}
+        gate_files = {key: b'\n'.join(HOST_GATE_ANCHORS[key]) for key in HOST_GATE_ASSETS}
+        files.update(gate_files)
         archive = app / verify.RESOURCE
         header_hash = write_archive(archive, files)
         integrity = {'Resources/app.asar': {'algorithm': 'SHA256', 'hash': header_hash}}
         info = {'CFBundleIdentifier': 'local.edoise.codex.readaloud', 'CFBundleExecutable': 'ChatGPT',
                 'CFBundleShortVersionString': verify.VERSION, 'CodexReadAloudVoicePickerVersion': 1,
                 'CodexReadAloudSelectionHighlightVersion': 1, 'CodexReadAloudSkipCodeBlocksVersion': 1,
-                'CodexReadAloudLauncherVersion': 2, 'CodexReadAloudUpdaterPolicyVersion': 1,
+                'CodexReadAloudLauncherVersion': 3, 'CodexReadAloudUpdaterPolicyVersion': 2,
                 'SUEnableAutomaticChecks': False, 'SUAutomaticallyUpdate': False,
                 'SUAllowsAutomaticUpdates': False, 'ElectronAsarIntegrity': integrity,
-                'LSEnvironment': {'CODEX_ELECTRON_USER_DATA_PATH': str(runtime.parent / 'user-data')}}
+                'LSEnvironment': {'CODEX_ELECTRON_USER_DATA_PATH': str(runtime.parent / 'user-data'),
+                                  'CODEX_SPARKLE_ENABLED': 'false'}}
         info_path = app / 'Contents/Info.plist'
         info_path.write_bytes(plistlib.dumps(info))
         framework = app / verify.FRAMEWORK
         framework.parent.mkdir(parents=True)
         framework.write_bytes(asar_integrity.SENTINEL + b'\x01\x01' +
                               asar_integrity.integrity_dictionary_digest(integrity))
-        (app / 'Contents/MacOS/ChatGPT').write_bytes(b'SUEnableAutomaticChecks\0SUAutomaticallyUpdate\0NO\0')
+        (app / 'Contents/MacOS/ChatGPT').write_bytes(
+            b'SUEnableAutomaticChecks\0SUAutomaticallyUpdate\0NO\0CODEX_SPARKLE_ENABLED\0false\0')
         (app / 'Contents/MacOS/ChatGPT-native').write_bytes(b'fixture native executable')
         commands = []
         def runner(arguments, **kwargs):
             commands.append(list(arguments))
-            return SimpleNamespace(returncode=0, stdout='', stderr='')
-        yield SimpleNamespace(root=root, app=app, home=home, source=source, runtime=runtime,
-                              archive=archive, info=info, info_path=info_path, files=files,
-                              header_hash=header_hash, framework=framework, runner=runner, commands=commands)
+            return SimpleNamespace(returncode=0, stdout='0\n' if arguments[0] == '/usr/bin/defaults' else '', stderr='')
+        with patch.dict(HOST_GATE_ASSETS, {key: hashlib.sha256(value).hexdigest()
+                                          for key, value in gate_files.items()}, clear=True):
+            yield SimpleNamespace(root=root, app=app, home=home, source=source, runtime=runtime,
+                                  archive=archive, info=info, info_path=info_path, files=files,
+                                  header_hash=header_hash, framework=framework, runner=runner, commands=commands)
 
 
 def check(data, **kwargs):
@@ -128,10 +135,21 @@ class VerifierTests(unittest.TestCase):
             self.assertTrue(report['voiceChoiceInformational'])
             self.assertEqual(report['voiceChoice'], 'af_aoede')
             self.assertEqual(report['availableVoiceCount'], 2)
-            self.assertEqual(report['packedAssetsVerified'], 5)
+            self.assertEqual(report['packedAssetsVerified'], 7)
+            self.assertTrue(report['updaterPolicy']['hostUpdaterDisabled'])
+            self.assertTrue(report['updaterPolicy']['manualUpdatesBlocked'])
             self.assertEqual(check(data, scope='installed')['activation'], 'installed')
             self.assertEqual((data.runtime / 'settings.json').read_bytes(), settings)
-            self.assertEqual(len(data.commands), 4)
+            self.assertEqual(len(data.commands), 6)
+
+    def test_installed_effective_preferences_cannot_hide_behind_stale_disk_values(self):
+        with fixture() as data:
+            prefs = data.home / 'Library/Preferences/local.edoise.codex.readaloud.plist'
+            prefs.parent.mkdir(parents=True)
+            prefs.write_bytes(plistlib.dumps({'SUEnableAutomaticChecks': False, 'SUAutomaticallyUpdate': False}))
+            data.runner = lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout='1\n', stderr='')
+            with self.assertRaisesRegex(RuntimeError, 'remains enabled'):
+                check(data, scope='installed')
 
     def test_saved_voice_can_change_or_be_absent_without_changing_build_identity(self):
         with fixture() as data:
@@ -201,10 +219,11 @@ class VerifierTests(unittest.TestCase):
                     runner=lambda arguments, **_kwargs: (_ for _ in ()).throw(subprocess.CalledProcessError(1, arguments)))
 
     def test_corruption_fails_with_normal_optimized_and_environment_optimized_python(self):
-        code = ('from pathlib import Path; import sys; import verify_voice_build as v; '
+        code = ('from pathlib import Path; import sys,json; import verify_voice_build as v; '
+                'import updater_host_gate as g; g.HOST_GATE_ASSETS.update(json.loads(sys.argv[4])); '
                 'v.verify_build(Path(sys.argv[1]),home=Path(sys.argv[2]),source_root=Path(sys.argv[3]),'
                 'runner=lambda *a,**k:None)')
-        for mutation in ('identity', 'marker', 'header', 'truncated', 'block_size', 'stale_worker', 'voice'):
+        for mutation in ('valid', 'identity', 'marker', 'header', 'truncated', 'block_size', 'stale_worker', 'voice'):
             with self.subTest(mutation=mutation), fixture() as data:
                 if mutation == 'identity':
                     data.info['CFBundleIdentifier'] = 'wrong'
@@ -232,8 +251,12 @@ class VerifierTests(unittest.TestCase):
                     environment.pop('PYTHONOPTIMIZE', None)
                     if optimized:
                         environment['PYTHONOPTIMIZE'] = optimized
-                    result = subprocess.run([sys.executable, *flag, '-c', code, str(data.app), str(data.home), str(data.source)],
+                    result = subprocess.run([sys.executable, *flag, '-c', code, str(data.app), str(data.home),
+                                             str(data.source), json.dumps(HOST_GATE_ASSETS)],
                                             cwd=verify.ROOT, env=environment, capture_output=True, text=True, timeout=5)
+                    if mutation == 'valid':
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        continue
                     self.assertNotEqual(result.returncode, 0, result.stdout)
                     self.assertNotIn('AssertionError', result.stderr)
                     self.assertIn('Error', result.stderr)
@@ -301,7 +324,7 @@ class LauncherStageTests(unittest.TestCase):
             self.assertEqual((data.app / 'Contents/MacOS/ChatGPT-native').read_bytes(), native)
             self.assertEqual((data.app / 'Contents/MacOS/ChatGPT').read_bytes(), b'updated wrapper')
             info = plistlib.loads(data.info_path.read_bytes())
-            self.assertEqual(info['CodexReadAloudLauncherVersion'], 2)
+            self.assertEqual(info['CodexReadAloudLauncherVersion'], 3)
             self.assertEqual(info['LSEnvironment']['CODEX_ELECTRON_USER_DATA_PATH'], str(profile))
             self.assertFalse(any('lsregister' in str(argument) for arguments in commands for argument in arguments))
 

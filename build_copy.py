@@ -11,6 +11,7 @@ import struct
 import subprocess
 
 from asar_integrity import patch_integrity_slot, rewrite_embedded_integrity
+from updater_host_gate import HOST_GATE_ASSETS, validate_host_gate_assets
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = Path('/Applications/ChatGPT.app')
@@ -123,7 +124,7 @@ def main():
     parser.add_argument('--refresh-copy', action='store_true',
                         help='Regenerate only the existing guarded experimental copy')
     parser.add_argument('--target', type=Path,
-                        help='Explicit experimental bundle path, including an installed local copy')
+                        help='Explicit scratch-stage bundle path; installed apps are refused')
     args = parser.parse_args()
     if args.target:
         TARGET = args.target.expanduser().absolute()
@@ -172,13 +173,16 @@ def main():
         if body + max(offset + size for _, offset, size in original_entries) != original.stat().st_size:
             raise SystemExit('Unexpected archive body layout')
         source_js = {}
-        for key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD):
+        for key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, *HOST_GATE_ASSETS):
             item = leaf(tree, key)
             stream.seek(body + int(item['offset']))
             data = stream.read(item['size'])
             if hashlib.sha256(data).hexdigest() != item['integrity']['hash']:
                 raise SystemExit(f'Original asset hash disagrees: {key}')
             source_js[key] = data.decode('utf-8')
+    # The launcher policy depends on these exact host modules honoring its gate.
+    # A host update must be reviewed before building another custom copy.
+    validate_host_gate_assets({key: source_js[key].encode('utf-8') for key in HOST_GATE_ASSETS})
     manager = (ROOT / 'speech-controller.mjs').read_text().replace('export function createResponseSpeaker', 'function createResponseSpeaker', 1)
     kokoro = (ROOT / 'kokoro-response-speaker.mjs').read_text().replace('export function createKokoroResponseSpeaker', 'function createKokoroResponseSpeaker', 1)
     picker = (ROOT / 'voice-picker.js').read_text()
@@ -254,7 +258,8 @@ def main():
     info['SUEnableAutomaticChecks'] = False
     info['SUAutomaticallyUpdate'] = False
     info['SUAllowsAutomaticUpdates'] = False
-    info['CodexReadAloudUpdaterPolicyVersion'] = 1
+    info.setdefault('LSEnvironment', {})['CODEX_SPARKLE_ENABLED'] = 'false'
+    info['CodexReadAloudUpdaterPolicyVersion'] = 2
     (TARGET / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     # Keep Electron's embedded dictionary digest consistent with the changed
     # archive header hash. ASAR validation remains enabled in the copied app.

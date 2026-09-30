@@ -25,6 +25,9 @@ int main(int argc, char **argv) {
     int written = snprintf(native, sizeof(native), "%s/ChatGPT-native", resolved);
     if (written < 0 || (size_t)written >= sizeof(native)) return 1;
     if (setenv("CODEX_ELECTRON_USER_DATA_PATH", READ_ALOUD_PROFILE, 1) != 0) return 1;
+    // The native host re-enables Sparkle checks during initialization unless this
+    // exact value disables that initialization. Override inherited launch values.
+    if (setenv("CODEX_SPARKLE_ENABLED", "false", 1) != 0) return 1;
     char profile_argument[PATH_MAX + 32];
     written = snprintf(profile_argument, sizeof(profile_argument), "--user-data-dir=%s", READ_ALOUD_PROFILE);
     if (written < 0 || (size_t)written >= sizeof(profile_argument)) return 1;

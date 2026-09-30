@@ -59,7 +59,7 @@ def main(app=APP, profile=PROFILE, register=False, refresh_launcher=False):
     if refresh_launcher:
         if (not native_binary.is_file() or native_binary.is_symlink()
                 or type(info.get('CodexReadAloudLauncherVersion')) is not int
-                or info['CodexReadAloudLauncherVersion'] not in (1, 2)
+                or info['CodexReadAloudLauncherVersion'] not in (1, 2, 3)
                 or info.get('LSEnvironment', {}).get('CODEX_ELECTRON_USER_DATA_PATH') != str(profile)):
             raise RuntimeError('Refreshing a launcher requires a configured stage with the same permanent profile')
     for item in (info_path, main_binary, *((native_binary,) if refresh_launcher else ())):
@@ -85,9 +85,10 @@ def main(app=APP, profile=PROFILE, register=False, refresh_launcher=False):
             working_main.rename(working_native)
         shutil.copy2(compiled, working_main)
         info.setdefault('LSEnvironment', {})['CODEX_ELECTRON_USER_DATA_PATH'] = str(profile)
-        info['CodexReadAloudLauncherVersion'] = 2
-        # Marker accompanies the native flags compiled from profile-launcher.c.
-        info['CodexReadAloudUpdaterPolicyVersion'] = 1
+        info['LSEnvironment']['CODEX_SPARKLE_ENABLED'] = 'false'
+        info['CodexReadAloudLauncherVersion'] = 3
+        # Marker accompanies the native Sparkle gate and preference overrides.
+        info['CodexReadAloudUpdaterPolicyVersion'] = 2
         (working / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
         entitlements = str(ROOT / 'local-entitlements.plist')
         subprocess.run(['codesign', '--force', '--sign', '-', '--options', 'runtime',

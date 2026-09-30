@@ -87,7 +87,8 @@ For an existing installation/update:
    Use build_copy.py --refresh-copy --target "build/ChatGPT Read Aloud.app".
    Recompile the staged launcher with configure_launcher.py --app
    "build/ChatGPT Read Aloud.app" --refresh-launcher. Never configure an installed
-   Applications bundle directly. Verify updater policy and native startup arguments;
+   Applications bundle directly. Verify updater policy, the pinned host updater
+   gate, and native startup environment and arguments;
    migrate only the custom domain's saved automatic-update preferences after quit.
    Confirm the private versioned worker matches the canonical source using a
    supported --upgrade-worker --worker-sha256 REVIEWED_SHA256 migration that
