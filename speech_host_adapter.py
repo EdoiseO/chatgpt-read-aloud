@@ -5,7 +5,7 @@ must be reviewed, including its completed-response and transcript boundaries.
 """
 import hashlib
 
-ADAPTER_VERSION = 2
+ADAPTER_VERSION = 3
 TOOLBAR_ASSET = 'webview/assets/sites-end-resource-ac1aa5fe0447.js'
 TOOLBAR_SHA256 = 'b812c93a6dc37c0d4069658d858a20f5430219ca916b65abdfde72a013a4a32b'
 VOICE_TIMELINE_ASSET = 'webview/assets/local-conversation-thread-b33b65c9da1e.js'
@@ -24,20 +24,43 @@ RESPONSE_RETURN = ('let Ht;return t[245]!==jt||t[246]!==Nt||t[247]!==Pt||t[248]!
                    '(Ht=(0,Y.jsxs)(`div`,{ref:jt,...Nt,className:Pt,title:Ft,children:[It,Lt,Bt,Vt]}),'
                    't[245]=jt,t[246]=Nt,t[247]=Pt,t[248]=Ft,t[249]=It,t[250]=Lt,t[251]=Bt,t[252]=Vt,t[253]=Ht):Ht=t[253],Ht}')
 READ_CONTROL = ('(W||codexReadAloudStandalone===!0)&&n.completed===!0&&Le.trim().length>0?'
-                '(0,Y.jsx)(`div`,{className:`mt-1.5 flex min-h-5 items-center gap-0.5`,'
-                '"data-codex-local-read-aloud":"response-controls",'
-                'children:(0,Y.jsx)(CodexLocalReadAloudButton,{getText:()=>Sr(Ie()),'
-                'getHtml:We,' + ROOT_ROUTING + '})}):null')
-# This root slot is independent of native toolbar visibility, copying and
-# compact-thread mode. Only the reviewed assistant entry points opt in when
-# showActionRow is false. Render the small outer root afresh: its original
-# compiler cache does not track the added prop, and must not retain stale speech
-# eligibility when a reused component switches between historical/live views.
-VISIBLE_RESPONSE_RETURN = ('return(0,Y.jsxs)(`div`,{ref:jt,...Nt,className:Pt,title:Ft,'
-                           'children:[It,Lt,Bt,Vt,' + READ_CONTROL + ']})}')
+                '(0,Y.jsx)(CodexLocalReadAloudButton,{getText:()=>Sr(Ie()),'
+                'getHtml:We,' + ROOT_ROUTING + '}):null')
+NATIVE_ACTION_PROPS = ('alwaysShowActions:W&&(V||(w?.length??0)>0),turnId:W?i:void 0,'
+                       'copyText:W&&Re?Le:void 0,getCopyText:W?Ie:void 0,getCopyHtml:W?We:void 0,'
+                       'sentAtMs:ae?null:n.sentAtMs,threadId:f,reportEntityType:ie,'
+                       'autoReviewStats:W?a:null,hookStats:W?o:null,memoryCitationEntries:W?Ke:cx,'
+                       'completedThreadGoal:W&&n.completed?x:null,hasArtifacts:re,'
+                       'onFork:W&&n.completed?b:void 0,showTimestampWithoutActions:oe,'
+                       'timestampHoverOnly:se,additionalActions:S,trailingActions:T,persistentAdditionalActions:w')
+NATIVE_ACTION_ROW = 'Je?(0,Y.jsx)(Xb,{' + NATIVE_ACTION_PROPS + '}):null'
+SHARED_ACTION_ROW = ('!Et&&Je?(0,Y.jsx)(Xb,{' + NATIVE_ACTION_PROPS + ',readAloudControl:codexReadAloudControl}):'
+                     'codexReadAloudControl==null?null:(0,Y.jsx)(`div`,{'
+                     'className:`mt-1.5 flex min-h-5 items-center gap-0.5`,'
+                     '"data-codex-local-read-aloud":"response-controls",children:codexReadAloudControl})')
+TOOLBAR_RETURN = ('let me;return t[44]!==M||t[45]!==ue||t[46]!==de||t[47]!==fe||t[48]!==pe?'
+                  '(me=(0,Y.jsxs)(`div`,{ref:M,className:ue,children:[de,fe,pe]}),'
+                  't[44]=M,t[45]=ue,t[46]=de,t[47]=fe,t[48]=pe,t[49]=me):me=t[49],me}')
+SHARED_TOOLBAR_RETURN = ('return(0,Y.jsxs)(`div`,{ref:M,className:ue,'
+                         '"data-codex-local-read-aloud":codexReadAloudControl!=null?"response-controls":void 0,'
+                         'children:[de,codexReadAloudControl,fe,pe]})}')
+# Compute speech once, then place it beside the native controls when their row
+# is available, otherwise in a speech-only row. Moving the action-row call out
+# of the cached content fragment keeps eligibility/root props fresh. The host's
+# native controls retain their placeholder guard, hover/focus opacity, and top margin;
+# speech is a sibling, so it stays visible without creating another row.
+VISIBLE_RESPONSE_RETURN = ('let codexReadAloudControl=' + READ_CONTROL + ';'
+                           'return(0,Y.jsxs)(`div`,{ref:jt,...Nt,className:Pt,title:Ft,'
+                           'children:[It,Lt,Bt,Vt,' + SHARED_ACTION_ROW + ']})}')
 PATCHES = (
     ('Response speech eligibility', 'allowCopyWhileStreaming:z}=e,B=',
      'allowCopyWhileStreaming:z,readAloudStandalone:codexReadAloudStandalone}=e,B='),
+    ('Move native actions beside speech', NATIVE_ACTION_ROW, 'null/* CODEX RESPONSE ACTIONS MOVED */'),
+    ('Shared response toolbar prop', 'actionRowRef:M}=e,N=',
+     'actionRowRef:M,readAloudControl:codexReadAloudControl}=e,N='),
+    ('Speech keeps shared toolbar present', 'if(!(oe||O!=null||te&&b!=null))return null;',
+     'if(!(oe||O!=null||te&&b!=null||codexReadAloudControl!=null))return null;'),
+    ('Persistent speech beside native controls', TOOLBAR_RETURN, SHARED_TOOLBAR_RETURN),
     ('Visible completed-response speech slot', RESPONSE_RETURN, VISIBLE_RESPONSE_RETURN),
     ('Legacy transcript assistant speech', TRANSCRIPT_ANCHOR, TRANSCRIPT_REPLACEMENT),
 )
@@ -105,4 +128,5 @@ def validate_patched_toolbar(text):
         restored = replace_once(restored, replacement, original, description)
     validate_original_toolbar(restored)
     return {'adapterVersion': ADAPTER_VERSION, 'completedResponsesOnly': True, 'realtimeAssistantControls': True,
-            'speechControlsAlwaysVisible': True, 'hostRendererSha256': TOOLBAR_SHA256}
+            'speechControlsAlwaysVisible': True, 'sharedResponseActionRow': True,
+            'hostRendererSha256': TOOLBAR_SHA256}

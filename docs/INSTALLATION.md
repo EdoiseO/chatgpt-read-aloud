@@ -178,6 +178,24 @@ journal, and recorded verified backup aliases. Do not run the fresh installer or
 delete those paths to make an update fit. Do not overwrite a running app bundle
 or its in-use archive.
 
+### macOS permissions after a rebuild
+
+The local builder currently uses an ad-hoc signature. A rebuild can change the
+app's designated requirement (the identity macOS checks for saved permissions),
+so macOS may ask again for permissions previously granted to the custom copy.
+Restarting an unchanged build should not by itself change that identity. The
+official ChatGPT app has its own separate identity and permission entries.
+
+Keeping permissions across rebuilt versions requires a persistent code-signing
+identity and compatible designated requirements. This is not configured by the
+current installer. Do not reset privacy records or weaken signing requirements
+to hide repeated prompts. See [Apple's code-signing requirements guide](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+
+**App Management** allows an app to update or delete other apps; playing speech
+does not require that permission. App installation may need it separately.
+
+### Prepare and activate an update
+
 1. Review the source changes and recheck the official version and signatures.
    Confirm the current custom app has its expected identity, launcher, profile,
    and integrity markers. If the source app's version differs, stop at the guard

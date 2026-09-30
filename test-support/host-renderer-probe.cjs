@@ -26,7 +26,8 @@ process.stdin.on('end', () => {
     Y, hx: { jsx, jsxs: jsx }, Nk: { jsx, jsxs: jsx }, Rk: { jsx, jsxs: jsx, Fragment: 'fragment' },
     ci: () => ({ formatMessage: ({ defaultMessage }) => defaultMessage }),
     d: () => ({ value: { routeKind: 'local-thread', routeTemplate: '/local' } }),
-    ot: atom => atom === 'Nf' ? atoms.compact : false, le: () => false, yi: () => null,
+    ot: atom => atom === 'Nf' ? atoms.compact : false,
+    le: atom => atom === 'Wd' ? true : atom === '$t' ? { submitCodexAnalyticsEvent() {} } : false, yi: () => null,
     J: (...values) => values.filter(Boolean).join(' '),
     yl: identity, yb: identity, Rh: identity, Mt: identity, Xa: identity,
     cc: identity, xd: identity, sr: identity, Gp: identity, Xs: identity, l: identity,
@@ -59,13 +60,22 @@ process.stdin.on('end', () => {
   function response(props, key) {
     const tree = render('Vb', { conversationId: 'fixture', assistantCopyText: 'A completed sentence.',
       item: { type: 'assistant-message', content: 'A completed sentence.', completed: true, phase: null }, ...props }, key);
-    const action = nodes(tree, ctx.Xb)[0];
-    return { tree, action, row: action ? render('Xb', action.props, key + '-row') : null };
+    const actions = nodes(tree, ctx.Xb);
+    assert.ok(actions.length <= 1, 'A response must not mount duplicate native action rows');
+    const action = actions[0], row = action ? render('Xb', action.props, key + '-row') : null;
+    // Materialize the actual shared row, as React does, so speech traversal and
+    // layout export include children passed through the new Xb prop.
+    if (action) {
+      assert.equal(tree.props.children.at(-1), action, 'Native actions must follow the content/cards once');
+      tree.props.children[tree.props.children.length - 1] = row;
+    }
+    return { tree, action, row };
   }
   const speech = tree => nodes(tree, ctx.CodexLocalReadAloudButton);
   const ordinary = response({ after: jsx('edit-card', { children: 'Edited file' }) }, 'ordinary');
   assert.equal(speech(ordinary.tree).length, 1);
-  assert.equal(speech(ordinary.row).length, 0); // Native Xb has no injected controls.
+  assert.equal(speech(ordinary.row).length, 1);
+  assert.equal(ordinary.row.props.children[1].type, ctx.CodexLocalReadAloudButton);
   assert.match(ordinary.row.props.children[0].props.className, /opacity-0/);
   const controls = ordinary.tree.props.children.at(-1);
   assert.equal(controls.props['data-codex-local-read-aloud'], 'response-controls');
@@ -80,12 +90,20 @@ process.stdin.on('end', () => {
   assert.equal(speech(ordinary.tree)[0].props.getHtml(), scopedRoot.html);
   const finalFragment = ordinary.tree.props.children[3];
   const order = finalFragment.props.children;
-  assert.ok(order.findIndex(node => nodes(node, 'edit-card').length) < order.findIndex(node => node?.type === ctx.Xb));
+  assert.ok(order.some(node => nodes(node, 'edit-card').length));
+  assert.equal(nodes(finalFragment, ctx.Xb).length, 0);
+  assert.equal(nodes(finalFragment, ctx.CodexLocalReadAloudButton).length, 0);
   const streaming = { type: 'assistant-message', content: 'A completed sentence.', completed: false, phase: null };
   assert.equal(speech(response({ item: streaming }, 'streaming').tree).length, 0);
   const copyWhileStreaming = response({ item: streaming, allowCopyWhileStreaming: true }, 'copy-stream');
   assert.equal(speech(copyWhileStreaming.tree).length, 0);
   assert.ok(nodes(copyWhileStreaming.row, 'ft').length > 0);
+  const placeholder = response({ item: { ...streaming, renderPlaceholderWhileStreaming: true },
+    allowCopyWhileStreaming: true, turnId: 'hidden-streaming-turn' }, 'placeholder');
+  assert.equal(placeholder.action, undefined, 'The host placeholder must still suppress its native action row');
+  assert.equal(nodes(placeholder.tree, 'ft').length, 0);
+  assert.equal(nodes(placeholder.tree, 'Tg').length, 0);
+  assert.equal(speech(placeholder.tree).length, 0);
   // Reuse the compiler cache with identical copy text across completion.
   assert.equal(speech(response({ allowCopyWhileStreaming: true }, 'copy-stream').tree).length, 1);
   assert.equal(response({ showActionRow: false }, 'silent').action, undefined);
@@ -171,6 +189,40 @@ process.stdin.on('end', () => {
   for (const enabled of [false, true, false]) {
     const rendered = response({ showActionRow: false, readAloudStandalone: enabled }, 'reuse-eligibility');
     assert.equal(speech(rendered.tree).length, enabled ? 1 : 0);
+  }
+  if (process.argv.includes('--layout-fixture')) {
+    // Export the actual pinned row structure, replacing complex host widgets
+    // with inert boxes. The offline browser checks row layout/visibility only;
+    // this is not a claim of full desktop rendering or audible playback.
+    function element(tag, attrs, children = []) { return { tag, attrs, children }; }
+    function button(name) { return element('button', { 'data-probe-control': name, 'aria-label': name }, [name]); }
+    function dom(tree) {
+      if (tree == null || typeof tree === 'boolean') return null;
+      if (typeof tree !== 'object') return String(tree);
+      if (tree.type === ctx.CodexLocalReadAloudButton) return element('fragment', {}, [button('read'), button('voice')]);
+      if (tree.type === 'ft') return button('copy');
+      if (tree.type === 'Tg') return button('rating');
+      if (tree.type === 'Dr') return button('fork');
+      if (tree.type === 'gg') return element('span', { 'data-probe-control': 'time' }, ['16:00']);
+      if (['Kb', 'ph', 'Iu'].includes(tree.type)) return null;
+      let tag = ['Jl', 'fragment', 'qi'].includes(tree.type) ? 'fragment' : tree.type;
+      if (tag === 'hl' || tag === 'edit-card') tag = 'div';
+      assert.ok(['div', 'span', 'fragment'].includes(tag), 'Unexpected layout fixture node: ' + String(tag));
+      const attrs = {};
+      for (const [name, value] of Object.entries(tree.props ?? {})) {
+        if (name === 'className') attrs.class = value;
+        else if (name.startsWith('data-') && value != null) attrs[name] = value;
+      }
+      const children = tree.props?.children;
+      return element(tag, attrs, (Array.isArray(children) ? children : [children]).map(dom).filter(value => value != null));
+    }
+    const ordinaryLayout = response({ turnId: 'layout-turn', onFork() {},
+      item: { type: 'assistant-message', content: 'A completed sentence.', completed: true, phase: null, sentAtMs: 1 },
+      after: jsx('edit-card', { children: 'Edited fixture document' }) }, 'layout-ordinary');
+    const voiceLayout = response({ showActionRow: false, readAloudStandalone: true }, 'layout-voice');
+    const makeLayout = (result, id) => { const node = dom(result.tree); node.attrs['data-probe-response'] = id; return node; };
+    process.stdout.write(JSON.stringify({ ordinary: makeLayout(ordinaryLayout, 'ordinary'), voice: makeLayout(voiceLayout, 'voice') }));
+    return;
   }
   process.stdout.write('Host renderer boundaries verified\n');
 });

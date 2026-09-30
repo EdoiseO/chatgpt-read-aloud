@@ -25,6 +25,7 @@ class SpeechHostTests(unittest.TestCase):
             self.assertTrue(report['completedResponsesOnly'])
             self.assertTrue(report['realtimeAssistantControls'])
             self.assertTrue(report['speechControlsAlwaysVisible'])
+            self.assertTrue(report['sharedResponseActionRow'])
             self.assertIn('/* other showActionRow:!1 remains untouched */', result)
 
     def test_changed_source_cannot_pass_by_retaining_matching_anchors(self):
@@ -74,8 +75,7 @@ class SpeechHostTests(unittest.TestCase):
                         self.assertRaisesRegex(ValueError, 'reviewed speech host'):
                     adapter.patch_voice_timeline(changed)
 
-    @unittest.skipUnless(shutil.which('node'), 'Node is required for the host renderer probe')
-    def test_actual_pinned_host_renderer_completed_transcript_and_streaming_boundaries(self):
+    def actual_host_inputs(self):
         official = Path('/Applications/ChatGPT.app/Contents/Resources/app.asar')
         if not official.is_file():
             self.skipTest('Official host unavailable; proprietary source is not bundled')
@@ -88,6 +88,12 @@ class SpeechHostTests(unittest.TestCase):
             item = leaf(tree, adapter.VOICE_TIMELINE_ASSET)
             stream.seek(body + int(item['offset']))
             voice_source = stream.read(item['size']).decode()
+            item = leaf(tree, 'webview/assets/app-shared-b42a855b3317.css')
+            stream.seek(body + int(item['offset']))
+            css = stream.read(item['size']).decode()
+        self.assertEqual(hashlib.sha256(css.encode()).hexdigest(),
+                         '47b83c45c6b351ab2e80c4c1ca4d9b8d97a67bccf723ca609db108915fd9277d',
+                         'Reviewed host layout CSS changed')
         patched = adapter.patch_toolbar(source)
         patched_voice = adapter.patch_voice_timeline(voice_source)
         functions = {}
@@ -100,11 +106,29 @@ class SpeechHostTests(unittest.TestCase):
         for name, boundary in [('Ik', 'var Lk,Rk;'), ('Ek', 'function Dk('), ('Dk', 'function Ok(')]:
             start = patched_voice.index('function ' + name + '(')
             functions[name] = patched_voice[start:patched_voice.index(boundary, start)]
+        return functions, css
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is required for the host renderer probe')
+    def test_actual_pinned_host_renderer_completed_transcript_and_streaming_boundaries(self):
+        functions, _css = self.actual_host_inputs()
         result = subprocess.run(['node', 'test-support/host-renderer-probe.cjs'],
                                 input=json.dumps(functions), capture_output=True,
                                 text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr[-4000:])
         self.assertIn('Host renderer boundaries verified', result.stdout)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is required for the host layout probe')
+    def test_actual_host_action_row_geometry_and_hover_focus_visibility(self):
+        functions, css = self.actual_host_inputs()
+        fixture = subprocess.run(['node', 'test-support/host-renderer-probe.cjs', '--layout-fixture'],
+                                 input=json.dumps(functions), capture_output=True,
+                                 text=True, timeout=10)
+        self.assertEqual(fixture.returncode, 0, fixture.stderr[-4000:])
+        result = subprocess.run(['node', 'test-support/host-action-layout.mjs'],
+                                input=json.dumps({'layouts': json.loads(fixture.stdout), 'css': css}),
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr[-4000:])
+        self.assertIn('Host action layout verified in an offline browser', result.stdout)
 
 
 if __name__ == '__main__':

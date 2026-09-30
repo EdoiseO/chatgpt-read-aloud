@@ -120,6 +120,11 @@ that controls render in every desktop view. The local host probe covers the
 legacy transcript renderer and the newer voice timeline's transcript and research
 routes, including hidden native toolbars. Desktop checks must also exercise saved
 voice sessions after restarting the app.
+The local layout probe renders the pinned host row structure with its original
+CSS in an offline browser. It checks that native and speech controls share one
+row, speech stays visible, and hover/focus do not shift the controls. Complex
+widgets are inert boxes in this probe, so the actual desktop layout still needs
+verification after activation.
 The original personal installation has been manually checked for playback,
 stopping, switching responses, reopening, selection reading, and highlighting.
 Fresh bootstrap/install helpers are separately tested with isolated fixtures;
