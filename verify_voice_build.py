@@ -25,6 +25,7 @@ def main():
     assert info['CFBundleShortVersionString'] == VERSION
     assert info['CodexReadAloudVoicePickerVersion'] == 1
     assert info['CodexReadAloudSelectionHighlightVersion'] == 1
+    assert info['CodexReadAloudSkipCodeBlocksVersion'] == 1
     assert info['CodexReadAloudLauncherVersion'] == 1
     assert info['LSEnvironment']['CODEX_ELECTRON_USER_DATA_PATH'] == str(
         Path.home() / 'Library/Application Support/ChatGPT Read Aloud/user-data')
@@ -98,6 +99,7 @@ def main():
               'signaturesVerified': True, 'embeddedAsarIntegrityVerified': True,
               'permanentProfilePreserved': True, 'voicePickerHooksVerified': True,
               'selectionHighlightHooksVerified': True,
+              'codeBlockSkippingVerified': True,
               'runtimeWorkerPath': str(worker_path), 'runtimeWorkerHash': worker_hash,
               'voiceChoice': selected_voice,
               'voiceName': selected_voice.split('_', 1)[1].title() if selected_voice else None,

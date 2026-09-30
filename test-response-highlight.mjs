@@ -30,7 +30,7 @@ async function documentTest(markup, run) {
   } finally { await context.close(); }
 }
 
-test('visible prose, link labels, lists, BRs and code keep readable block boundaries', async () => {
+test('visible prose, link labels, lists and BRs remain readable while code blocks are skipped', async () => {
   const value = await documentTest(`<section id="response">
     <p> First <strong>bold</strong> <a href="https://example.invalid/not-spoken">link label</a>.</p>
     <ul><li>One</li><li>Two<br>line<br><br>next</li></ul>
@@ -40,8 +40,9 @@ test('visible prose, link labels, lists, BRs and code keep readable block bounda
     <span style="display:none">CSS hidden</span><span style="visibility:hidden">Invisible</span>
     <span inert>Inert control</span><script>notSpoken()</script><style>.not-spoken{}</style>
     <span data-markdown-copy="exclude">Excluded annotation</span><span class="sr-only">Screenreader duplicate</span>
+    <svg><title>Standalone icon title</title></svg>
   </section>`, () => window.helpers.buildResponseTextMap(document.querySelector('#response')).text);
-  assert.equal(value, 'First bold link label.\n\nOne\nTwo\nline\n\nnext\n\nconst x = 1;\n  console.log(x);');
+  assert.equal(value, 'First bold link label.\n\nOne\nTwo\nline\n\nnext');
 });
 
 test('trimming, collapsed whitespace and UTF-16 emoji offsets retain exact DOM ranges', async () => {
@@ -94,18 +95,133 @@ test('cross-response, collapsed, multiple, and toolbar-only selections are rejec
   assert.deepEqual(value, { cross: null, toolbar: null, collapsed: null, multiple: null });
 });
 
-test('selection element boundaries and preformatted CRLF text have aligned ranges', async () => {
-  const value = await documentTest('<div id="response"><p>alpha <em>beta</em> gamma <strong>delta</strong></p><pre id="code"></pre></div>', () => {
+test('element selections and preformatted prose retain aligned CRLF ranges; PRE maps empty', async () => {
+  const value = await documentTest('<div id="response"><p>alpha <em>beta</em> gamma <strong>delta</strong></p><div id="formatted" style="white-space:pre-wrap"></div><pre id="code"></pre></div>', () => {
     const root = document.querySelector('#response'), p = root.querySelector('p');
     const range = document.createRange(); range.setStart(p, 1); range.setEnd(p, 3);
     const selection = { rangeCount: 1, isCollapsed: false, getRangeAt: () => range };
     const selected = window.helpers.captureResponseSelection(root, selection);
     const code = root.querySelector('#code'); code.textContent = '  one\r\n  two  ';
     const codeMap = window.helpers.buildResponseTextMap(code);
-    const start = codeMap.text.indexOf('two');
-    return { selected: selected.text, code: codeMap.text, lastWord: codeMap.rangeForOffsets(start, start + 3).toString() };
+    const formatted = root.querySelector('#formatted'); formatted.textContent = '  one\r\n  two  ';
+    const proseMap = window.helpers.buildResponseTextMap(formatted), start = proseMap.text.indexOf('two');
+    return { selected: selected.text, code: codeMap.text, codeSpans: codeMap.sentenceSpans(),
+      prose: proseMap.text, lastWord: proseMap.rangeForOffsets(start, start + 3).toString() };
   });
-  assert.deepEqual(value, { selected: 'beta gamma', code: 'one\n  two', lastWord: 'two' });
+  assert.deepEqual(value, { selected: 'beta gamma', code: '', codeSpans: [], prose: 'one\n  two', lastWord: 'two' });
+});
+
+test('fenced wrapper excludes code, language header and controls without swallowing surrounding explanation', async () => {
+  const value = await documentTest(`<section id="response">
+    <p>Before the example.</p>
+    <div data-markdown-copy="code-block" data-markdown-copy-text="def example():">
+      <div><span>Python</span><button>Copy code</button></div><pre><code>def example():\n    return 1</code></pre>
+    </div>
+    <div><p>Nested explanation.</p><pre><code>const hidden = true;</code></pre><p>Further explanation.</p></div>
+    <span data-markdown-copy-text="ordinary copy metadata">After the example.</span>
+  </section>`, () => {
+    const map = window.helpers.buildResponseTextMap(document.querySelector('#response'));
+    return { text: map.text, sentences: map.sentenceSpans('en').map(span => map.text.slice(span.start, span.end)) };
+  });
+  assert.equal(value.text, 'Before the example.\n\nNested explanation.\n\nFurther explanation.\n\nAfter the example.');
+  assert.deepEqual(value.sentences, ['Before the example.', 'Nested explanation.', 'Further explanation.', 'After the example.']);
+});
+
+test('skipped PRE introduces a paragraph break between adjacent prose text nodes', async () => {
+  const value = await documentTest('<section id="response">Before.<pre><code>{}</code></pre>After.</section>', () => {
+    const map = window.helpers.buildResponseTextMap(document.querySelector('#response'));
+    return { text: map.text, sentences: map.sentenceSpans('en').map(span => map.text.slice(span.start, span.end)),
+      mappedRanges: map.rangesForOffsets(0, map.text.length).map(range => range.toString()),
+      encompassingRange: map.rangeForOffsets(0, map.text.length) };
+  });
+  assert.deepEqual(value, { text: 'Before.\n\nAfter.', sentences: ['Before.', 'After.'],
+    mappedRanges: ['Before.', 'After.'], encompassingRange: null });
+});
+
+test('code-only maps and selections are empty, including header/subtree roots, and native selection remains', async () => {
+  const value = await documentTest(`<section id="response"><div data-markdown-copy="code-block">
+    <span id="header">javascript</span><pre><code id="code">const answer = 1;</code></pre>
+  </div></section>`, () => {
+    const root = document.querySelector('#response'), code = document.querySelector('#code'), header = document.querySelector('#header');
+    const before = root.innerHTML, range = document.createRange(), selection = getSelection();
+    range.selectNodeContents(code); selection.removeAllRanges(); selection.addRange(range);
+    const selectedBefore = selection.toString(), captured = window.helpers.captureResponseSelection(root);
+    const codeSelectionUnchanged = selection.toString() === selectedBefore;
+    const codeMap = window.helpers.buildResponseTextMap(code), rootMap = window.helpers.buildResponseTextMap(root);
+    range.selectNodeContents(header); selection.removeAllRanges(); selection.addRange(range);
+    const headerBefore = selection.toString(), capturedHeader = window.helpers.captureResponseSelection(root);
+    return { rootText: rootMap.text, codeText: codeMap.text, rootSpans: rootMap.sentenceSpans(),
+      captured, capturedHeader, headerText: window.helpers.buildResponseTextMap(header).text,
+      codeSelectionBefore: selectedBefore, codeSelectionUnchanged, headerSelectionUnchanged: selection.toString() === headerBefore,
+      markupUnchanged: root.innerHTML === before };
+  });
+  assert.deepEqual(value, { rootText: '', codeText: '', rootSpans: [], captured: null, capturedHeader: null,
+    headerText: '', codeSelectionBefore: 'const answer = 1;', codeSelectionUnchanged: true,
+    headerSelectionUnchanged: true, markupUnchanged: true });
+});
+
+test('mixed selected range omits code and highlights only selected prose without modifying blue selection', async () => {
+  const value = await documentTest('<section id="response"><p>Start before.</p><pre><code id="code">{\n  secret();\n}</code></pre><p>Continue after.</p></section>', () => {
+    const root = document.querySelector('#response'), paragraphs = root.querySelectorAll('p'), before = root.innerHTML;
+    const range = document.createRange(); range.setStart(paragraphs[0].firstChild, 6); range.setEnd(paragraphs[1].firstChild, 8);
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    const nativeBefore = getSelection().toString(), selected = window.helpers.captureResponseSelection(root);
+    const highlighter = window.helpers.createResponseHighlighter(selected.map);
+    const spans = selected.map.sentenceSpans('en');
+    highlighter.onProgress({ start: 0, end: selected.text.length });
+    const highlighted = [...CSS.highlights.get(window.helpers.RESPONSE_HIGHLIGHT_NAME)].map(piece => piece.toString());
+    const text = selected.text, sentences = spans.map(span => selected.text.slice(span.start, span.end));
+    highlighter.onProgress(spans[1]);
+    const second = [...CSS.highlights.get(window.helpers.RESPONSE_HIGHLIGHT_NAME)].map(piece => piece.toString()).join('');
+    highlighter.onProgress(null);
+    return { text, sentences, highlighted, second,
+      nativeSelectionUnchanged: getSelection().toString() === nativeBefore, nativeSelectionStillContainsCode: nativeBefore.includes('secret();'),
+      markupUnchanged: root.innerHTML === before, cleared: !CSS.highlights.has(window.helpers.RESPONSE_HIGHLIGHT_NAME) };
+  });
+  assert.deepEqual(value, { text: 'before.\n\nContinue', sentences: ['before.', 'Continue'],
+    highlighted: ['before.', 'Continue'], second: 'Continue', nativeSelectionUnchanged: true,
+    nativeSelectionStillContainsCode: true, markupUnchanged: true, cleared: true });
+});
+
+test('block or multiline preformatted CODE is skipped while ordinary inline code stays in prose', async () => {
+  const value = await documentTest(`<style>.block-code{display:block}</style><section id="response">
+    <p>Run <code class="language-shell">git status</code> then <code style="white-space:pre-wrap">git diff</code>
+      or <code style="display:inline-block">git show</code>.</p>
+    <code class="block-code">const dropped = true;</code>
+    <code style="white-space:pre-wrap">first dropped line\nsecond dropped line</code>
+    <code style="display:grid">also dropped</code>
+    <p>Continue reading.</p>
+  </section>`, () => {
+    const root = document.querySelector('#response'), map = window.helpers.buildResponseTextMap(root);
+    return { text: map.text, blocks: [...root.querySelectorAll('code')].map(code => window.helpers.isResponseCodeBlock(code)),
+      sentences: map.sentenceSpans('en').map(span => map.text.slice(span.start, span.end)) };
+  });
+  assert.equal(value.text, 'Run git status then git diff or git show.\n\nContinue reading.');
+  assert.deepEqual(value.blocks, [false, false, false, true, true, true]);
+  assert.deepEqual(value.sentences, ['Run git status then git diff or git show.', 'Continue reading.']);
+});
+
+test('selection beginning or ending inside code keeps only its selected surrounding prose', async () => {
+  const value = await documentTest('<section id="response"><p>Before explanation.</p><pre><code id="code">const hidden = true;</code></pre><p>After explanation.</p></section>', () => {
+    const root = document.querySelector('#response'), paragraphs = root.querySelectorAll('p'), code = root.querySelector('code').firstChild;
+    const range = document.createRange(); range.setStart(code, 6); range.setEnd(paragraphs[1].firstChild, 5);
+    const selected = { rangeCount: 1, isCollapsed: false, getRangeAt: () => range };
+    const fromCode = window.helpers.captureResponseSelection(root, selected);
+    range.setStart(paragraphs[0].firstChild, 7); range.setEnd(code, 12);
+    const toCode = window.helpers.captureResponseSelection(root, selected);
+    return { fromCode: fromCode.text, toCode: toCode.text,
+      fromCodeRange: fromCode.map.rangeForOffsets(0, fromCode.text.length).toString(),
+      toCodeRange: toCode.map.rangeForOffsets(0, toCode.text.length).toString() };
+  });
+  assert.deepEqual(value, { fromCode: 'After', toCode: 'explanation.', fromCodeRange: 'After', toCodeRange: 'explanation.' });
+});
+
+test('shared code-block classifier handles detached copy HTML without omitting inline CODE', async () => {
+  const value = await documentTest('<div></div>', () => {
+    const document = new DOMParser().parseFromString('<div data-markdown-copy="code-block"><span>javascript</span><code>hidden()</code></div><pre>more()</pre><code style="display:block">block()</code><code style="white-space:pre-wrap">one\ntwo</code><code style="white-space:pre-wrap">inline()</code>', 'text/html');
+    return [...document.body.children].map(element => window.helpers.isResponseCodeBlock(element));
+  });
+  assert.deepEqual(value, [true, true, true, true, false]);
 });
 
 test('sentence spans preserve abbreviations, paragraph/list boundaries, and cover nonwhitespace content', async () => {

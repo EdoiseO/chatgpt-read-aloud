@@ -23,21 +23,25 @@ may take several seconds while the model loads. ChatGPT/Codex's normal response
 generation still uses OpenAI. See [third-party notices](../THIRD_PARTY.md) for
 component licenses.
 
-## Code-reading limitations
+## Reading behavior
 
-Code blocks and selected code are included in speech input, but pronunciation
-is handled as prose. Some operators are simplified or omitted.
+Read aloud skips code blocks and continues with the surrounding explanation.
+This applies to whole responses and selected passages. A selection containing
+only a code block produces no speech and never expands to the whole response.
+Inline code within prose remains part of its sentence.
 
-A confirmed bug occurs when a symbol-only line, such as `{` or `}`, produces
-no phonemes. The worker skips it, but the playback/progress controller rejects the
-forward jump to the next spoken range. Reading can stop before following text;
-if the first range is silent, it can invoke Apple speech fallback instead.
-A silent trailing line can finish normally. This remains unfixed.
+The connected text mapper omits preformatted code and the desktop app's
+`data-markdown-copy="code-block"` wrappers, including their headers. Speech
+offsets and highlights are built from the remaining prose, so excluded code
+does not contribute a sentence or receive a highlight. The HTML fallback also
+filters blocks, and its Markdown fallback removes fenced blocks.
+Unstructured copied text without HTML or Markdown fences cannot reliably
+distinguish code from prose; the connected desktop view is the primary path.
 
-The investigation exercised 37 local backend cases, including six exact
-browser-mapped code/selection fixtures. Emitted WAVs were valid; controller
-replays used mocked media. These checks establish the progress mismatch, not a
-live app click test or faithful pronunciation of every code symbol.
+Code exclusion avoids the reproduced interruption caused by brace-only code
+lines producing no phonemes. Separate symbol-only lines in ordinary prose can
+still expose the speech controller's existing progress limitation. Inline
+operator pronunciation is handled as prose and may be simplified.
 
 ## Development and verification
 

@@ -14,8 +14,27 @@ function within(root, node) {
   return node === root || !!root?.contains?.(node);
 }
 
+function tagName(element) {
+  return (element?.tagName || '').toUpperCase();
+}
+
+// The supported app marks fenced-code wrappers this way, including their
+// language header and copy controls. Never omit a generic ancestor of PRE:
+// it may also contain the explanation surrounding a code example.
+export function isResponseCodeBlock(element, view = element?.ownerDocument?.defaultView) {
+  const tag = tagName(element);
+  if (tag === 'PRE' || element?.getAttribute?.('data-markdown-copy') === 'code-block') return true;
+  if (tag !== 'CODE') return false;
+  let style = element.style;
+  try { style = view?.getComputedStyle?.(element) || style; } catch { /* Detached copy HTML uses inline styles. */ }
+  if (/^(block|flow-root|flex|grid|table|list-item)$/.test(style?.display || '')) return true;
+  // Inline snippets may use pre-wrap without being fenced blocks. Require
+  // actual line breaks for a preformatted CODE element lacking a block box.
+  return /^(pre|pre-wrap|break-spaces)$/.test(style?.whiteSpace || '') && /[\r\n]/.test(element.textContent || '');
+}
+
 function visibleElement(element, view) {
-  if (OMIT_TAGS.has(element.tagName) || element.hidden || element.inert ||
+  if (OMIT_TAGS.has(tagName(element)) || element.hidden || element.inert ||
       element.getAttribute?.('aria-hidden') === 'true' ||
       element.getAttribute?.('data-markdown-copy') === 'exclude' ||
       element.classList?.contains('sr-only') ||
@@ -116,20 +135,28 @@ export function buildResponseTextMap(root, { range = null } = {}) {
     if (range) {
       try { if (!range.intersectsNode(node)) return; } catch { return; }
     }
-    if (node.tagName === 'BR') {
+    if (isResponseCodeBlock(node, view)) {
+      boundary(2);
+      return;
+    }
+    const tag = tagName(node);
+    if (tag === 'BR') {
       pendingSpace = null;
       pendingBreaks = Math.min(2, pendingBreaks + 1);
       return;
     }
-    const breaks = PARAGRAPHS.has(node.tagName) ? 2 : BLOCKS.has(node.tagName) ? 1 : 0;
+    const breaks = PARAGRAPHS.has(tag) ? 2 : BLOCKS.has(tag) ? 1 : 0;
     if (breaks) boundary(breaks);
     let whitespace;
     try { whitespace = view?.getComputedStyle?.(node)?.whiteSpace; } catch { /* Fall back to PRE. */ }
-    const preformatted = preserve || node.tagName === 'PRE' || /^(pre|pre-wrap|break-spaces)$/.test(whitespace || '');
+    const preformatted = preserve || /^(pre|pre-wrap|break-spaces)$/.test(whitespace || '');
     for (const child of node.childNodes || []) walk(child, preformatted);
     if (breaks) boundary(breaks);
   }
-  if (root && document?.createRange && (!range || within(root, range.startContainer) && within(root, range.endContainer))) walk(root);
+  let blockAncestor = root;
+  while (blockAncestor && !isResponseCodeBlock(blockAncestor, view)) blockAncestor = blockAncestor.parentElement;
+  if (root && !blockAncestor && document?.createRange &&
+      (!range || within(root, range.startContainer) && within(root, range.endContainer))) walk(root);
   // Trim units with the exact same operation as speech text, retaining offset
   // alignment even when a selection starts/ends inside collapsed whitespace.
   const untrimmed = units.map(unit => unit.char).join('');
@@ -168,6 +195,9 @@ export function buildResponseTextMap(root, { range = null } = {}) {
     const result = document.createRange();
     result.setStart(pieces[0].startContainer, pieces[0].startOffset);
     result.setEnd(pieces.at(-1).endContainer, pieces.at(-1).endOffset);
+    // One encompassing Range must not reintroduce skipped code or controls.
+    // Callers needing disjoint prose fragments use rangesForOffsets instead.
+    if (result.toString().replace(/\s/gu, '') !== content.slice(start, end).replace(/\s/gu, '')) return null;
     return result;
   }
   return Object.freeze({ root, text: content, rangeForOffsets, rangesForOffsets,

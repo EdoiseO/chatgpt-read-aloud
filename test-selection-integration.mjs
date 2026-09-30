@@ -26,7 +26,7 @@ async function isolated(markup, run) {
     await page.evaluate(({ source, menu }) => {
       const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
       let hooks;
-      const starts = [], nexts = [], cancels = [], audios = [], alerts = [], voiceJobs = [];
+      const starts = [], nexts = [], cancels = [], audios = [], alerts = [], voiceJobs = [], voiceChecks = [];
       let interruption, holdVoices = false;
       const react = {
         useState(initial) { const index = hooks.index++, state = hooks; if (!(index in state.slots)) state.slots[index] = initial; return [state.slots[index], value => { state.slots[index] = value; }]; },
@@ -50,7 +50,7 @@ async function isolated(markup, run) {
         ended() { this.onended?.(); }
       };
       window.codexLocalReadAloud = {
-        getVoices() { if (!holdVoices) return Promise.resolve({ selectedVoice: 'af_aoede' }); const job = deferred(); voiceJobs.push(job); return job.promise; },
+        getVoices() { voiceChecks.push(true); if (!holdVoices) return Promise.resolve({ selectedVoice: 'af_aoede' }); const job = deferred(); voiceJobs.push(job); return job.promise; },
         start(id, text, options) { const job = { id, text, options, ...deferred() }; starts.push(job); return job.promise; },
         next(id) { const job = { id, ...deferred() }; nexts.push(job); return job.promise; },
         cancel(id) { cancels.push(id); return Promise.resolve({ done: true }); },
@@ -72,11 +72,11 @@ async function isolated(markup, run) {
         for (const child of Array.isArray(children) ? children : [children]) { const rendered = treeNode(child); if (rendered) node.append(rendered); }
         return node;
       }
-      function mount(root) {
+      function mount(root, fallback = {}) {
         const state = { slots: [], effects: new Map(), cleanups: new Map(), pending: [], index: 0 };
         const host = document.createElement('div'); document.body.append(host);
         const instance = {
-          render() { hooks = state; state.index = 0; const tree = window.__actualComponent({ getRoot: () => root, getText: () => 'WRONG Markdown [copy](url)', getHtml: () => '<p>WRONG HTML</p>' }); host.replaceChildren(treeNode(tree)); for (const index of state.pending.splice(0)) state.cleanups.set(index, state.effects.get(index)()); return host; },
+          render() { hooks = state; state.index = 0; const tree = window.__actualComponent({ getRoot: () => root, getText: () => fallback.text ?? 'WRONG Markdown [copy](url)', getHtml: () => 'html' in fallback ? fallback.html : '<p>WRONG HTML</p>' }); host.replaceChildren(treeNode(tree)); for (const index of state.pending.splice(0)) state.cleanups.set(index, state.effects.get(index)()); return host; },
           get button() { return host.querySelector('[data-codex-local-read-aloud="response"]'); },
           unmount() { for (const cleanup of state.cleanups.values()) cleanup?.(); host.remove(); },
         };
@@ -91,7 +91,7 @@ async function isolated(markup, run) {
       const fire = (node, type, init = {}) => node.dispatchEvent(type.startsWith('pointer') ? new PointerEvent(type, { bubbles: true, cancelable: true, button: 0, ...init }) : new MouseEvent(type, { bubbles: true, cancelable: true, button: 0, detail: type === 'click' ? 1 : 0, ...init }));
       const highlighted = () => { const highlight = CSS.highlights.get('codex-read-aloud-active-sentence'); return highlight ? [...highlight].map(range => range.toString()).join('') : null; };
       const chunk = (request, index = 0) => ({ done: false, mimeType: 'audio/wav', audioBase64: 'AA==', sentenceStart: request.options.sentenceRanges[index].start, sentenceEnd: request.options.sentenceRanges[index].end });
-      window.fixture = { mount, select, tick, fire, highlighted, starts, nexts, cancels, audios, alerts, voiceJobs, chunk,
+      window.fixture = { mount, select, tick, fire, highlighted, starts, nexts, cancels, audios, alerts, voiceJobs, voiceChecks, chunk,
         menu(root, range) { const tree = makeMenu(root, range); const node = treeNode(tree); if (node) document.body.append(node); return node; },
         holdVoices(value) { holdVoices = value; }, interrupt(id) { interruption?.({ requestId: id }); },
       };
@@ -217,4 +217,100 @@ test('normal completion clears last sentence and unmount removes floating select
     return { beforeEnded, afterEnded, canceled: f.cancels.includes(request.id), removedRegistration: f.menu(root, range) === null, alerts: f.alerts };
   });
   assert.deepEqual(value, { beforeEnded: 'Finished sentence.', afterEnded: null, canceled: true, removedRegistration: true, alerts: [] });
+});
+
+test('whole-response reading skips the code wrapper and headers, keeps inline code and later prose, and never highlights code', async () => {
+  const value = await isolated('<div id="response"><p>Before <code>git status</code>.</p><div data-markdown-copy="code-block"><div>JavaScript example <button>Copy</button></div><pre><code>doNotRead();\n}</code></pre></div><p>After the example.</p></div>', async () => {
+    const f = fixture, root = document.querySelector('#response'), code = root.querySelector('[data-markdown-copy="code-block"]');
+    const original = root.innerHTML, mounted = f.mount(root);
+    f.fire(mounted.button, 'click'); await f.tick(); const request = f.starts[0];
+    request.resolve(f.chunk(request)); await f.tick();
+    const highlights = [], onlyProse = [];
+    for (let index = 0; index < request.options.sentenceRanges.length; index++) {
+      f.audios[index].playing(); await f.tick();
+      highlights.push(f.highlighted());
+      onlyProse.push([...CSS.highlights.get('codex-read-aloud-active-sentence')]
+        .every(range => !code.contains(range.startContainer) && !code.contains(range.endContainer)));
+      f.nexts[index].resolve(index + 1 < request.options.sentenceRanges.length ? f.chunk(request, index + 1) : { done: true });
+      await f.tick(); f.audios[index].ended(); await f.tick();
+    }
+    return { text: request.text, highlights, onlyProse, finished: f.highlighted(), unchanged: original === root.innerHTML, alerts: f.alerts };
+  });
+  assert.deepEqual(value, { text: 'Before git status.\n\nAfter the example.', highlights: ['Before git status.', 'After the example.'],
+    onlyProse: [true, true], finished: null, unchanged: true, alerts: [] });
+});
+
+test('code-only selection stays silent after pointer focus loss and has no floating reading action', async () => {
+  const value = await isolated('<div id="response"><p>Do not widen to this prose.</p><div data-markdown-copy="code-block"><div>Python <button>Copy</button></div><pre><code>onlyCode()\n   </code></pre></div><p>Or this later prose.</p></div>', async () => {
+    const f = fixture, root = document.querySelector('#response'), mounted = f.mount(root), text = root.querySelector('code').firstChild;
+    const range = f.select(text, 0, text.length); mounted.render();
+    const menuMissing = f.menu(root, range) === null;
+    // Even a direct stale invocation of the public action must not widen.
+    await window.codexReadSelectionAloud(root, range); await f.tick();
+    f.fire(mounted.button, 'pointerdown'); getSelection().removeAllRanges(); mounted.button.focus();
+    f.fire(mounted.button, 'mousedown'); f.fire(mounted.button, 'click'); await f.tick();
+    f.select(text, 0, text.length); f.fire(mounted.button, 'click', { detail: 0 }); await f.tick();
+    f.select(text, text.length - 3, text.length); f.fire(mounted.button, 'click', { detail: 0 }); await f.tick();
+    return { menuMissing, requests: f.starts.length, voiceChecks: f.voiceChecks.length, alerts: f.alerts };
+  });
+  assert.deepEqual(value, { menuMissing: true, requests: 0, voiceChecks: 0, alerts: [] });
+});
+
+test('a mixed selection reads only its clipped prose on both sides of code and keeps native selection unchanged', async () => {
+  const value = await isolated('<div id="response"><p>Outside. Chosen before.</p><pre><code>unselectedCode();\n}</code></pre><p>Chosen after. Outside tail.</p></div>', async () => {
+    const f = fixture, root = document.querySelector('#response'), mounted = f.mount(root), paragraphs = root.querySelectorAll('p');
+    const range = document.createRange(); range.setStart(paragraphs[0].firstChild, 9); range.setEnd(paragraphs[1].firstChild, 13);
+    getSelection().removeAllRanges(); getSelection().addRange(range); document.dispatchEvent(new Event('selectionchange'));
+    const native = getSelection().toString(), menu = f.menu(root, range);
+    f.fire(menu, 'mousedown'); f.fire(menu, 'click'); await f.tick(); const request = f.starts[0];
+    request.resolve(f.chunk(request)); await f.tick(); f.audios[0].playing(); await f.tick(); const first = f.highlighted();
+    f.nexts[0].resolve(f.chunk(request, 1)); await f.tick(); f.audios[0].ended(); await f.tick(); f.audios[1].playing(); await f.tick();
+    const code = root.querySelector('pre');
+    const highlightedProseOnly = [...CSS.highlights.get('codex-read-aloud-active-sentence')]
+      .every(piece => !code.contains(piece.startContainer) && !code.contains(piece.endContainer));
+    return { text: request.text, first, second: f.highlighted(), highlightedProseOnly,
+      nativeUnchanged: native === getSelection().toString(), nativeIncludesCode: native.includes('unselectedCode'), alerts: f.alerts };
+  });
+  assert.deepEqual(value, { text: 'Chosen before.\n\nChosen after.', first: 'Chosen before.', second: 'Chosen after.',
+    highlightedProseOnly: true, nativeUnchanged: true, nativeIncludesCode: true, alerts: [] });
+});
+
+test('root-missing HTML fallback strips code headers and blocks without dropping later prose or inline code', async () => {
+  const value = await isolated('', async () => {
+    const f = fixture, mounted = f.mount(null, {
+      html: '<p>Use <code style="white-space:pre-wrap">git status</code>.</p><div data-markdown-copy="code-block"><div>Shell header</div><pre><code>neverRead()</code></pre></div><code style="display:block">alsoCode()</code><p>Continue here.</p>',
+      get text() { throw new Error('Raw copy getter must not run for usable structured HTML'); },
+    });
+    f.fire(mounted.button, 'click'); await f.tick();
+    return { text: f.starts[0]?.text, options: f.starts[0]?.options, voiceChecks: f.voiceChecks.length, alerts: f.alerts };
+  });
+  assert.deepEqual(value, { text: 'Use git status.\n\nContinue here.', options: undefined, voiceChecks: 1, alerts: [] });
+});
+
+test('code-only HTML fallback and disconnected response do not resurrect raw copied code', async () => {
+  const value = await isolated('', async () => {
+    const f = fixture, disconnected = document.createElement('div'); disconnected.innerHTML = '<pre>alsoRawCode()</pre>';
+    for (const root of [null, disconnected]) {
+      const mounted = f.mount(root, { html: '<div data-markdown-copy="code-block"><div>JSON</div><pre>{ "code": true }</pre></div>', text: 'unfencedRawCode()' });
+      f.fire(mounted.button, 'click'); await f.tick(); mounted.unmount();
+    }
+    return { requests: f.starts.length, voiceChecks: f.voiceChecks.length, alerts: f.alerts };
+  });
+  assert.deepEqual(value, { requests: 0, voiceChecks: 0, alerts: [] });
+});
+
+test('raw-only Markdown fallback skips closed and streamed fences without DOMParser; supplied HTML fails closed', async () => {
+  const value = await isolated('', async () => {
+    const f = fixture;
+    window.DOMParser = undefined;
+    const mounted = f.mount(null, { html: null, text: 'Before `inline()`.\n```js\nhiddenCode()\n```\nAfter.\n~~~sh\nunclosedCode()' });
+    f.fire(mounted.button, 'click'); await f.tick(); const text = f.starts[0]?.text; mounted.unmount();
+    const html = f.mount(null, { html: '<p>Structured prose.</p><pre>rawCode()</pre>', text: 'rawCode()' });
+    f.fire(html.button, 'click'); await f.tick(); html.unmount();
+    window.DOMParser = class { parseFromString() { throw new Error('Parser unavailable'); } };
+    const failed = f.mount(null, { html: '<pre>rawCode()</pre>', text: 'rawCode()' });
+    f.fire(failed.button, 'click'); await f.tick(); failed.unmount();
+    return { text, requests: f.starts.length, voiceChecks: f.voiceChecks.length, alerts: f.alerts };
+  });
+  assert.deepEqual(value, { text: 'Before `inline()`.\n\nAfter.', requests: 1, voiceChecks: 1, alerts: [] });
 });

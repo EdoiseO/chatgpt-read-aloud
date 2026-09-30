@@ -101,7 +101,7 @@ function fixture() {
   }
   return {
     mount, manager, bridge, jobs, saves, toggles, alerts, chosen,
-    response(text) { return mount('CodexLocalReadAloudButton', { getText: () => text }); },
+    response(text, html) { return mount('CodexLocalReadAloudButton', { getText: () => text, getHtml: () => html }); },
     picker() {
       return mount('CodexReadAloudVoicePicker', {
         bridge, speaker: manager, onClose() { closes++; },
@@ -191,6 +191,36 @@ test('saved Aoede starts its attached response directly without another voice ch
   assert.equal(f.saves.length, 0, 'playback must not require another set_voice call');
   assert.equal(f.alerts.length, 0);
   response.unmount();
+});
+
+test('raw Markdown fallback skips backtick and tilde fences, including an unclosed streamed block', async () => {
+  const f = fixture(), response = f.response([
+    'Use `git status` to inspect changes.',
+    '```inline()``` stays inline.',
+    '````javascript', 'secretBacktickCode();', '```', 'stillCode();', '````',
+    'This later prose remains.',
+    '   ~~~python', 'secretTildeCode()', '   ~~~~',
+    'This prose also remains.', '```sh', 'unclosedCode()',
+  ].join('\n'));
+  const pending = read(response.render()).props.onClick(event());
+  f.jobs[0].resolve({ selectedVoice: 'af_aoede' }); await pending;
+  assert.equal(f.toggles[0].text,
+    'Use `git status` to inspect changes.\n```inline()``` stays inline.\n\nThis later prose remains.\n\nThis prose also remains.');
+  assert.equal(f.alerts.length, 0); response.unmount();
+});
+
+test('code-only fenced Markdown does not request voices or start a response', async () => {
+  const f = fixture(), response = f.response('~~~json\n{"only": "code"}\n~~~');
+  await read(response.render()).props.onClick(event());
+  assert.equal(f.jobs.length, 0); assert.equal(f.toggles.length, 0);
+  assert.equal(f.alerts.length, 0); response.unmount();
+});
+
+test('supplied HTML without a parser fails closed instead of reading copied raw code', async () => {
+  const f = fixture(), response = f.response('rawCodeWithoutFences()', '<pre>rawCodeWithoutFences()</pre>');
+  await read(response.render()).props.onClick(event());
+  assert.equal(f.jobs.length, 0); assert.equal(f.toggles.length, 0);
+  assert.equal(f.alerts.length, 0); response.unmount();
 });
 
 test('picker does not choose a default; preview uses the explicitly selected voice', async () => {

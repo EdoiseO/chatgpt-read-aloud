@@ -246,6 +246,7 @@ def main():
     info['CFBundleIdentifier'] = 'local.edoise.codex.readaloud'
     info['CodexReadAloudVoicePickerVersion'] = 1
     info['CodexReadAloudSelectionHighlightVersion'] = 1
+    info['CodexReadAloudSkipCodeBlocksVersion'] = 1
     # Avoid registering the experimental copy for the official app's deep links.
     info.pop('CFBundleURLTypes', None)
     info['SUEnableAutomaticChecks'] = False

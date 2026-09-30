@@ -2,7 +2,8 @@
 
 This local read-aloud add-on adds a speaker button to completed Codex responses
 through a separate patched copy of ChatGPT for Mac. It can read a whole response
-or a selected passage, with a soft yellow highlight following the sentence whose audio is
+or a selected passage, skipping code blocks and continuing with the surrounding
+explanation. A soft yellow highlight follows the sentence whose audio is
 playing. The goal is reading support and focus. The project makes no medical
 claims.
 
@@ -13,8 +14,7 @@ verification reports stay on your Mac.
 For an agent-assisted installation, use the copy/paste prompt in
 [INSTALL_WITH_CODEX.md](INSTALL_WITH_CODEX.md).
 
-See [development notes](DEVELOPMENT.md) for model details, tests, and current
-code-reading limitations.
+See [development notes](DEVELOPMENT.md) for model details, tests, and reading behavior.
 
 ## Requirements
 
@@ -264,6 +264,11 @@ automation cannot control Codex.
 - **Selected passage:** select part of that response and use its speaker or the
   floating **Read aloud** action. Only the selected passage is spoken. A
   selection spanning separate responses must not be accepted as one passage.
+- **Code blocks:** read a response with prose before and after a code block.
+  It skips the code and its header, then continues with the next paragraph.
+  Selecting only the code produces no speech and never reads the whole response.
+  Selecting prose across a code block reads only the selected prose; highlights
+  stay on that prose. Inline code within a sentence remains included.
 - **Voice:** preview a draft choice without saving; close the picker and confirm
   the saved choice remains. Save a chosen voice, quit/reopen, and confirm the next
   response uses it automatically. Stop playback before testing another choice.

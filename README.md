@@ -8,7 +8,7 @@ own profile.
 
 ## Features
 
-- Read a completed response or **just the text you select**.
+- Read a completed response or **just the text you select**, skipping code blocks.
 - Follow a **soft yellow highlight** as each sentence plays.
 - Stop playback or switch to another response.
 - Preview and save your choice of **28 English voices**.
@@ -32,7 +32,6 @@ Currently supports **ChatGPT 26.928.20755**, **macOS 26+**, and **Apple Silicon*
 New app versions need a compatible rebuild. This is a community add-on installed
 as a patched copy; there is no official plugin integration or affiliation with OpenAI.
 
-**Known limitation:** symbol-only code lines can interrupt reading.
-[Details and development notes](docs/DEVELOPMENT.md).
+[Behavior details and development notes](docs/DEVELOPMENT.md).
 
 [MIT license](LICENSE) · [Model and dependency credits](THIRD_PARTY.md)

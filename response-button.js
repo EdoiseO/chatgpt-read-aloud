@@ -4,8 +4,7 @@ let codexReadAloudSelection = null;
 const codexReadAloudResponses = new Map();
 function codexRangeBelongsToResponse(root, range) {
   return !!(root?.isConnected && range && !range.collapsed
-    && root.contains(range.startContainer) && root.contains(range.endContainer)
-    && range.toString().trim());
+    && root.contains(range.startContainer) && root.contains(range.endContainer));
 }
 function codexFindSelectedResponse(root, range) {
   if (!codexRangeBelongsToResponse(root, range)) return null;
@@ -15,7 +14,10 @@ function codexFindSelectedResponse(root, range) {
   }
   return null;
 }
-globalThis.codexCanReadSelectionAloud = (root, range) => !!codexFindSelectedResponse(root, range);
+globalThis.codexCanReadSelectionAloud = (root, range) => {
+  const response = codexFindSelectedResponse(root, range);
+  return !!response?.canReadRange(range);
+};
 globalThis.codexReadSelectionAloud = (root, range) => {
   const response = codexFindSelectedResponse(root, range);
   if (response) return response.readRange(range.cloneRange());
@@ -73,16 +75,34 @@ function codexGetReadAloudSpeaker() {
   });
   return codexLocalResponseSpeaker;
 }
+function codexWithoutFencedCode(value) {
+  const readable = [];
+  let fence = null;
+  for (const line of String(value ?? "").split(/\r\n?|\n/)) {
+    if (fence) {
+      const close = line.match(/^ {0,3}(`+|~+)[\t ]*$/);
+      if (close && close[1][0] === fence.character && close[1].length >= fence.length) fence = null;
+      continue;
+    }
+    const open = line.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (open && !(open[1][0] === "`" && open[2].includes("`"))) {
+      fence = { character: open[1][0], length: open[1].length };
+      readable.push("");
+    } else readable.push(line);
+  }
+  // An unclosed fence owns everything after it, as in a streamed response.
+  return readable.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
 function codexReadableResponseText(html, fallback) {
-  if (!html || typeof globalThis.DOMParser !== "function") return fallback;
+  if (!html) return codexWithoutFencedCode(fallback);
+  if (typeof globalThis.DOMParser !== "function") return "";
   try {
-    // A detached document keeps response markup inert while retaining link labels.
+    // The same mapper skips fenced-code wrappers/headers and preserves inline
+    // code. A valid empty HTML result must never resurrect raw copied code.
     const document = new globalThis.DOMParser().parseFromString(html, "text/html");
-    document.querySelectorAll("script,style,[aria-hidden='true']").forEach(node => node.remove());
-    document.querySelectorAll("p,li,pre,blockquote,h1,h2,h3,h4,h5,h6,tr,br").forEach(node => node.append("\n"));
-    return document.body.textContent.replace(/\n{3,}/g, "\n\n").trim() || fallback;
+    return buildResponseTextMap(document.body).text;
   } catch {
-    return fallback;
+    return "";
   }
 }
 function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
@@ -112,6 +132,11 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
     codexReadAloudResponses.set(token.current, {
       root: () => rootGetter.current?.(),
       readRange: range => beginRead(range, true),
+      canReadRange: range => {
+        try { return !!captureResponseSelection(rootGetter.current?.(), {
+          isCollapsed: range.collapsed, rangeCount: 1, getRangeAt: () => range,
+        })?.map.text.trim(); } catch { return false; }
+      },
     });
     const selectionChanged = () => {
       const selection = globalThis.document?.getSelection?.();
@@ -142,14 +167,20 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
     if (root?.isConnected) {
       const selection = range ? { isCollapsed: range.collapsed, rangeCount: 1, getRangeAt: () => range }
         : globalThis.document?.getSelection?.();
-      const selected = captureResponseSelection(root, selection);
-      if (range && !selected) throw new Error("The selected passage is no longer available.");
-      const map = selected?.map ?? buildResponseTextMap(root);
+      const selectedRange = selection?.rangeCount === 1 ? selection.getRangeAt(0) : null;
+      const ownedSelection = codexRangeBelongsToResponse(root, selectedRange);
+      if (range && !ownedSelection) throw new Error("The selected passage is no longer available.");
+      const selected = ownedSelection ? captureResponseSelection(root, selection) : null;
+      // An owned selection containing only omitted code stays an empty read;
+      // it must not become a request for the whole response.
+      if (ownedSelection && !selected) return null;
+      const map = selected ? selected.map : buildResponseTextMap(root);
       if (!map.text.trim()) return null;
       return { text: map.text, map, sentenceRanges: map.sentenceSpans() };
     }
     if (range) throw new Error("The selected response is no longer available.");
-    const text = String(codexReadableResponseText(getHtml?.(), getText()) ?? "").trim();
+    const html = getHtml?.();
+    const text = String(codexReadableResponseText(html, html ? "" : getText()) ?? "").trim();
     return text ? { text } : null;
   }
 
@@ -178,7 +209,7 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
     codexCancelReadAloudSelection();
     speaker.stop();
     let read;
-    try { read = captured ?? prepareRead(range); }
+    try { read = captured ? captured.read : prepareRead(range); }
     catch { globalThis.alert("Could not read this response. Please try again."); return; }
     if (!read) return;
     const selection = {
@@ -217,7 +248,7 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
       if (event.type === "mousedown" && capturedRead.current) event.preventDefault();
       return;
     }
-    try { capturedRead.current = prepareRead(selection.getRangeAt(0).cloneRange()); }
+    try { capturedRead.current = { read: prepareRead(selection.getRangeAt(0).cloneRange()) }; }
     catch { /* The click handler reports an unavailable selection. */ }
     if (event.type === "mousedown") event.preventDefault();
   }

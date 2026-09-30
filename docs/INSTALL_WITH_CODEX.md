@@ -16,7 +16,10 @@ I want the local read-aloud add-on for completed Codex responses in ChatGPT for
 Mac, installed through a separate patched copy called ChatGPT Read Aloud.
 With no text selected, it should read that one response. With a passage selected
 in that response, its speaker or the floating
-Read aloud action should read only the passage. A soft yellow highlight should
+Read aloud action should read only the passage. Skip code blocks and continue
+with the surrounding prose. If I select only a code
+block, do not read it or expand to the whole response. Inline code within a
+sentence can stay with the sentence. A soft yellow highlight should
 follow the sentence whose audio is actually playing, preserving normal blue
 selection and response formatting. I want the local Kokoro 82M MLX float32
 runtime and a saved voice that I choose in the picker. Aoede (af_aoede) is an
