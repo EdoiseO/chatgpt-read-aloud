@@ -12,7 +12,8 @@ import subprocess
 
 from asar_integrity import patch_integrity_slot, rewrite_embedded_integrity
 from updater_host_gate import HOST_GATE_ASSETS, validate_host_gate_assets
-from speech_host_adapter import TOOLBAR_ASSET, patch_toolbar, append_payload
+from speech_host_adapter import (ADAPTER_VERSION, TOOLBAR_ASSET, VOICE_TIMELINE_ASSET,
+                                 patch_toolbar, patch_voice_timeline, append_payload)
 from update_menu_adapter import HOST_MENU_ASSET, UPDATE_MAIN, patch_update_menu
 
 ROOT = Path(__file__).resolve().parent
@@ -173,7 +174,7 @@ def main():
         if body + max(offset + size for _, offset, size in original_entries) != original.stat().st_size:
             raise SystemExit('Unexpected archive body layout')
         source_js = {}
-        for key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, HOST_MENU_ASSET, *HOST_GATE_ASSETS):
+        for key in (ASSET, VOICE_TIMELINE_ASSET, SELECTION_ASSET, EARLY, PRELOAD, HOST_MENU_ASSET, *HOST_GATE_ASSETS):
             item = leaf(tree, key)
             stream.seek(body + int(item['offset']))
             data = stream.read(item['size'])
@@ -195,6 +196,7 @@ def main():
     subprocess.run(['node', '--check', str(ROOT / 'patched-toolbar.mjs')], check=True)
     replacements = {
         ASSET: replacement,
+        VOICE_TIMELINE_ASSET: patch_voice_timeline(source_js[VOICE_TIMELINE_ASSET]).encode(),
         SELECTION_ASSET: patch_selection_menu(source_js[SELECTION_ASSET]).encode(),
         EARLY: exact_replace(source_js[EARLY], EARLY_ANCHOR,
                              EARLY_ANCHOR + 'require("./local-read-aloud-main.cjs");',
@@ -205,7 +207,7 @@ def main():
         HOST_MENU_ASSET: patch_update_menu(source_js[HOST_MENU_ASSET]).encode(),
         UPDATE_MAIN: (ROOT / 'update-checker.cjs').read_bytes(),
     }
-    for key in (SELECTION_ASSET, EARLY, PRELOAD, MAIN, HOST_MENU_ASSET, UPDATE_MAIN):
+    for key in (VOICE_TIMELINE_ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN, HOST_MENU_ASSET, UPDATE_MAIN):
         syntax_file = ROOT / ('patched-' + Path(key).name)
         syntax_file.write_bytes(replacements[key])
         subprocess.run(['node', '--check', str(syntax_file)], check=True)
@@ -251,7 +253,7 @@ def main():
     info['CodexReadAloudVoicePickerVersion'] = 1
     info['CodexReadAloudSelectionHighlightVersion'] = 1
     info['CodexReadAloudSkipCodeBlocksVersion'] = 1
-    info['CodexReadAloudSpeechHostAdapterVersion'] = 1
+    info['CodexReadAloudSpeechHostAdapterVersion'] = ADAPTER_VERSION
     info['CodexReadAloudUpdateCheckerVersion'] = 1
     # Avoid registering the experimental copy for the official app's deep links.
     info.pop('CFBundleURLTypes', None)

@@ -27,10 +27,12 @@ component licenses.
 ## Reading behavior
 
 Reading controls sit outside the host's hover-only action group. Completed
-voice-session assistant entries use the same response component and scoped text
-mapper. User messages, empty responses, streaming ordinary replies, and silent
-automation completions remain excluded. The speech host adapter pins the
-reviewed asset and verifies its complete contents after reversing the patch.
+voice-session transcripts and associated research output have a separate speech
+row because the host suppresses its normal toolbar on those entries. They use
+the same response component and scoped text mapper. User messages, empty
+responses, streaming replies, and silent automation completions remain excluded.
+The speech host adapter pins both the response renderer and the voice timeline
+renderer, and verifies their complete contents after reversing the patch.
 
 Read aloud skips code blocks and continues with the surrounding explanation.
 This applies to whole responses and selected passages. A selection containing
@@ -113,6 +115,11 @@ node --test test-kokoro-runtime.cjs
 
 Those checks preserve the live voice settings. Valid generated audio and source
 tests do not replace the [manual audible UI checks](INSTALLATION.md#check-the-feature-in-the-actual-app).
+The bundle verifier checks integration bytes and signatures; it does not prove
+that controls render in every desktop view. The local host probe covers the
+legacy transcript renderer and the newer voice timeline's transcript and research
+routes, including hidden native toolbars. Desktop checks must also exercise saved
+voice sessions after restarting the app.
 The original personal installation has been manually checked for playback,
 stopping, switching responses, reopening, selection reading, and highlighting.
 Fresh bootstrap/install helpers are separately tested with isolated fixtures;

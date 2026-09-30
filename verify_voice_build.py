@@ -19,7 +19,8 @@ from asar_integrity import patch_integrity_slot
 from build_copy import ASSET, SELECTION_ASSET, SELECTION_BUTTON, EARLY, PRELOAD, MAIN, FRAMEWORK, RESOURCE, VERSION
 from runtime_voices import read_saved_voice, supported_voice_ids
 from updater_host_gate import HOST_GATE_ASSETS, validate_host_gate_assets
-from speech_host_adapter import validate_patched_toolbar
+from speech_host_adapter import (ADAPTER_VERSION, VOICE_TIMELINE_ASSET, ROOT_ROUTING,
+                                 validate_patched_toolbar, validate_patched_voice_timeline)
 from update_menu_adapter import HOST_MENU_ASSET, UPDATE_MAIN, validate_update_menu
 
 ROOT = Path(__file__).resolve().parent
@@ -125,7 +126,7 @@ def verify_archive(path, recorded_hash):
             require(digest.hexdigest() == item['integrity']['hash'], f'ASAR packed asset SHA256 disagrees: {key}')
             require(blocks == item['integrity']['blocks'], f'ASAR packed block hashes disagree: {key}')
             count += 1
-            if key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN, HOST_MENU_ASSET, UPDATE_MAIN, *HOST_GATE_ASSETS):
+            if key in (ASSET, VOICE_TIMELINE_ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN, HOST_MENU_ASSET, UPDATE_MAIN, *HOST_GATE_ASSETS):
                 require(size <= MAX_HOOK_BYTES, f'ASAR speech hook exceeds the verification limit: {key}')
                 stream.seek(body + offset)
                 try:
@@ -204,14 +205,16 @@ def verify_build(app, *, home=None, official=Path('/Applications/ChatGPT.app'), 
     recorded = info.get('ElectronAsarIntegrity', {}).get('Resources/app.asar', {}).get('hash')
     hooks, count, header_hash = verify_archive(app / RESOURCE, recorded)
     validate_host_gate_assets({key: value.encode('utf-8') for key, value in hooks.items() if key in HOST_GATE_ASSETS})
-    for key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN, HOST_MENU_ASSET, UPDATE_MAIN):
+    for key in (ASSET, VOICE_TIMELINE_ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN, HOST_MENU_ASSET, UPDATE_MAIN):
         require(key in hooks, f'Required speech hook asset is missing: {key}')
     speech_host = validate_patched_toolbar(hooks[ASSET])
+    speech_host['voiceTimeline'] = validate_patched_voice_timeline(hooks[VOICE_TIMELINE_ASSET])
     validate_update_menu(hooks[HOST_MENU_ASSET])
     require(type(info.get('CodexReadAloudUpdateCheckerVersion')) is int and
             info['CodexReadAloudUpdateCheckerVersion'] == 1, 'Manual update checker marker is missing')
     require(type(info.get('CodexReadAloudSpeechHostAdapterVersion')) is int and
-            info['CodexReadAloudSpeechHostAdapterVersion'] == 1, 'Speech host adapter marker is missing')
+            info['CodexReadAloudSpeechHostAdapterVersion'] == ADAPTER_VERSION,
+            'Speech host adapter marker is missing or stale')
     update_checker_hash = hashlib.sha256(hooks[UPDATE_MAIN].encode()).hexdigest()
     require(update_checker_hash == hashlib.sha256((source_root / 'update-checker.cjs').read_bytes()).hexdigest(),
             'Bundled manual update checker is stale')
@@ -228,7 +231,7 @@ def verify_build(app, *, home=None, official=Path('/Applications/ChatGPT.app'), 
         require(expected in hooks[ASSET], f'Bundled speech controller is stale: {source}')
     require((source_root / 'response-highlight.mjs').read_text().replace('export ', '') in hooks[ASSET],
             'Bundled response highlighter is stale')
-    require(hooks[ASSET].count('getReadAloudRoot:()=>ye.current?.querySelector(`[data-selected-text-overlay-target]`)') == 1,
+    require(hooks[ASSET].count(ROOT_ROUTING) == 1,
             'Scoped response-root routing is missing or duplicated')
     require('::highlight(' in hooks[ASSET] and 'sentenceRanges' in hooks[PRELOAD], 'Sentence highlighting hooks are missing')
     require(hooks[SELECTION_ASSET].count('"data-codex-local-read-aloud":"selection"') == 1,
@@ -259,7 +262,9 @@ def verify_build(app, *, home=None, official=Path('/Applications/ChatGPT.app'), 
             'voiceName': selected_voice.split('_', 1)[1].title() if selected_voice else None,
             'availableVoiceCount': len(voices), 'voiceChoiceInformational': True,
             'updaterPolicy': updater, 'asarHeaderHash': header_hash, 'mainModuleHash': main_hash,
-            'manualAudioVerified': False, 'verificationScope': scope, 'activation': scope}
+            'manualAudioVerified': False, 'desktopBehaviorVerified': False,
+            'integrationVerification': 'static pinned assets and hook routing; desktop UI checks required',
+            'verificationScope': scope, 'activation': scope}
 
 
 def main():

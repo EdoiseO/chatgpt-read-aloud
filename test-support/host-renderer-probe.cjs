@@ -10,30 +10,42 @@ process.stdin.on('end', () => {
   const identity = value => value;
   const jsx = (type, props) => ({ type, props });
   const caches = new Map();
+  const refs = new Map();
   let renderer;
+  let refIndex;
   const compiler = { c(size) { const key = renderer + ':' + size; if (!caches.has(key)) caches.set(key, Array(size).fill(Symbol.for('react.memo_cache_sentinel'))); return caches.get(key); } };
-  const react = { useRef: () => ({ current: null }), useEffect() {}, useEffectEvent: identity };
+  const react = { useRef(initial) { const key = renderer + ':ref:' + refIndex++; if (!refs.has(key)) refs.set(key, { current: initial }); return refs.get(key); }, useEffect() {}, useEffectEvent: identity };
+  const atoms = { realtime: undefined, item: undefined, turn: undefined, compact: false };
+  // Y is the JSX binding in the response module and the atom reader in the
+  // voice-history module. A callable stub with JSX properties serves both
+  // isolated functions without evaluating either module's imports.
+  const Y = Object.assign(atom => ({ wn: atoms.realtime, D: atoms.item, C: atoms.turn })[atom],
+    { jsx, jsxs: jsx, Fragment: 'fragment' });
   const ctx = {
-    ix: compiler, px: compiler, ax: react, mx: { Fragment: 'fragment' },
-    Y: { jsx, jsxs: jsx, Fragment: 'fragment' }, hx: { jsx, jsxs: jsx },
+    ix: compiler, px: compiler, Mk: compiler, Lk: compiler, ax: react, mx: { Fragment: 'fragment' },
+    Y, hx: { jsx, jsxs: jsx }, Nk: { jsx, jsxs: jsx }, Rk: { jsx, jsxs: jsx, Fragment: 'fragment' },
     ci: () => ({ formatMessage: ({ defaultMessage }) => defaultMessage }),
     d: () => ({ value: { routeKind: 'local-thread', routeTemplate: '/local' } }),
-    ot: () => false, le: () => false, yi: () => null,
+    ot: atom => atom === 'Nf' ? atoms.compact : false, le: () => false, yi: () => null,
     J: (...values) => values.filter(Boolean).join(' '),
     yl: identity, yb: identity, Rh: identity, Mt: identity, Xa: identity,
     cc: identity, xd: identity, sr: identity, Gp: identity, Xs: identity, l: identity,
     Ay: () => [], Fb: () => ({}), vb: () => ({}), Dl: identity, Sr: identity,
+    Hl: root => ({ htmlText: root.html }), tm: (key, id) => key + ':' + id,
+    kn: text => [{ type: 'inline-markdown', content: text.replace('::codex-realtime-inline{}\n', '') }],
     cx: [], sx: [], Ll: {}, zb: {},
     CodexLocalReadAloudButton: function Speech() {},
   };
   for (const name of ['uo', 'na', 'ux', 'Nf', 'fc', 'As', 'Ju', 'fu', 'lu', 'Kb',
     'ph', 'Rv', 'Dm', 'rh', 'kb', 'D', '_h', 'fg', 'gg', 'hl', 'Jl', 'C', 'ui', 'ox',
     'yy', 'gy', 'Yr', 'xl', '$t', 'Wd', 'Tg', 'ft', 'qi', 'Dr', 'G', 'Iu', 'xy', 'lg',
-    'Zb', 'Qb', '_g']) ctx[name] ??= name;
+    'Zb', 'Qb', '_g', 'wn', 'Uy', 'Vy']) ctx[name] ??= name;
   vm.createContext(ctx);
   vm.runInContext(Object.values(functions).join('\n'), ctx, { timeout: 1000 });
+  ctx.Kv = ctx.Vb; // Exact import alias used by both canonical voice renderers.
   function render(name, props, key = name) {
     renderer = key;
+    refIndex = 0;
     ctx.__props = props;
     return vm.runInContext(`${name}(__props)`, ctx, { timeout: 1000 });
   }
@@ -50,30 +62,35 @@ process.stdin.on('end', () => {
     const action = nodes(tree, ctx.Xb)[0];
     return { tree, action, row: action ? render('Xb', action.props, key + '-row') : null };
   }
-  const speech = row => nodes(row, ctx.CodexLocalReadAloudButton);
+  const speech = tree => nodes(tree, ctx.CodexLocalReadAloudButton);
   const ordinary = response({ after: jsx('edit-card', { children: 'Edited file' }) }, 'ordinary');
-  assert.equal(speech(ordinary.row).length, 1);
-  assert.equal(ordinary.row.props.children[0].type, ctx.CodexLocalReadAloudButton);
-  assert.match(ordinary.row.props.children[1].props.className, /opacity-0/);
-  assert.equal(ordinary.row.props.children[0].props.getText(), 'A completed sentence.');
+  assert.equal(speech(ordinary.tree).length, 1);
+  assert.equal(speech(ordinary.row).length, 0); // Native Xb has no injected controls.
+  assert.match(ordinary.row.props.children[0].props.className, /opacity-0/);
+  const controls = ordinary.tree.props.children.at(-1);
+  assert.equal(controls.props['data-codex-local-read-aloud'], 'response-controls');
+  assert.doesNotMatch(controls.props.className, /opacity-0/);
+  assert.equal(speech(ordinary.tree)[0].props.getText(), 'A completed sentence.');
   assert.equal(ordinary.tree.props.className, 'group flex min-w-0 flex-col');
-  const scopedRoot = { id: 'this-response-only' };
+  const scopedRoot = { id: 'this-response-only', html: '<p>Only this response</p>' };
   ordinary.tree.props.ref.current = { querySelector(selector) {
     assert.equal(selector, '[data-selected-text-overlay-target]'); return scopedRoot;
   } };
-  assert.equal(ordinary.row.props.children[0].props.getRoot(), scopedRoot);
-  const finalFragment = ordinary.tree.props.children.at(-1);
+  assert.equal(speech(ordinary.tree)[0].props.getRoot(), scopedRoot);
+  assert.equal(speech(ordinary.tree)[0].props.getHtml(), scopedRoot.html);
+  const finalFragment = ordinary.tree.props.children[3];
   const order = finalFragment.props.children;
   assert.ok(order.findIndex(node => nodes(node, 'edit-card').length) < order.findIndex(node => node?.type === ctx.Xb));
   const streaming = { type: 'assistant-message', content: 'A completed sentence.', completed: false, phase: null };
-  assert.equal(speech(response({ item: streaming }, 'streaming').row).length, 0);
+  assert.equal(speech(response({ item: streaming }, 'streaming').tree).length, 0);
   const copyWhileStreaming = response({ item: streaming, allowCopyWhileStreaming: true }, 'copy-stream');
-  assert.equal(speech(copyWhileStreaming.row).length, 0);
+  assert.equal(speech(copyWhileStreaming.tree).length, 0);
   assert.ok(nodes(copyWhileStreaming.row, 'ft').length > 0);
   // Reuse the compiler cache with identical copy text across completion.
-  assert.equal(speech(response({ allowCopyWhileStreaming: true }, 'copy-stream').row).length, 1);
+  assert.equal(speech(response({ allowCopyWhileStreaming: true }, 'copy-stream').tree).length, 1);
   assert.equal(response({ showActionRow: false }, 'silent').action, undefined);
-  assert.equal(speech(response({ assistantCopyText: '', item: { ...streaming, content: '', completed: true } }, 'empty').row).length, 0);
+  assert.equal(speech(response({ showActionRow: false }, 'silent').tree).length, 0);
+  assert.equal(speech(response({ assistantCopyText: '', item: { ...streaming, content: '', completed: true } }, 'empty').tree).length, 0);
   const transcript = render('fx', { conversationId: 'fixture', entries: [
     { role: 'user', text: 'User words' }, { role: 'assistant', text: 'Transcript response.' },
     { role: 'assistant', text: '## Research\n\n| Name | Value |\n| --- | --- |\n| One | Two |' },
@@ -82,12 +99,78 @@ process.stdin.on('end', () => {
   const assistants = nodes(transcript, ctx.Vb);
   assert.equal(assistants.length, 2);
   for (const [index, node] of assistants.entries()) {
-    assert.equal(node.props.showActionRow, true);
+    assert.equal(node.props.showActionRow, false);
+    assert.equal(node.props.readAloudStandalone, true);
     assert.equal(node.props.item.completed, true);
-    assert.equal(speech(response(node.props, 'transcript-' + index).row).length, 1);
+    const rendered = response(node.props, 'transcript-' + index);
+    assert.equal(rendered.action, undefined);
+    assert.equal(speech(rendered.tree).length, 1);
   }
   // Xb is shared with host views beyond Vb. A copyable row without the explicit
   // completed-response routing must not acquire speech controls accidentally.
   assert.equal(speech(render('Xb', { copyText: 'Unrelated copyable content' }, 'unrelated')).length, 0);
+  // Historical events in the user's report are canonical transcriptSegment and
+  // bemItemPromoted/inlineMarkdown entries, not the legacy fx transcript path.
+  // Neutral content below reproduces their structure without private history.
+  function voice(name, props, key) {
+    const route = render(name, { canonical: true, conversationId: 'fixture', cwd: '/fixture',
+      hostId: 'fixture-host', turnSearchKey: 'turn-fixture', ...props }, key);
+    const assistant = nodes(route, ctx.Vb)[0];
+    if (!assistant) return { route };
+    assert.equal(assistant.props.showActionRow, false);
+    assert.equal(assistant.props.readAloudStandalone, true);
+    return { route, assistant, ...response(assistant.props, key + '-response') };
+  }
+  const savedEntry = { id: 'voice-fixture', role: 'assistant', text: 'Saved transcript text.', completed: true };
+  for (const compact of [false, true]) {
+    atoms.compact = compact;
+    atoms.realtime = undefined;
+    const saved = voice('Ik', { entry: savedEntry }, 'canonical-' + compact);
+    assert.equal(saved.action, undefined);
+    assert.equal(speech(saved.tree).length, 1);
+    assert.equal(speech(saved.tree)[0].props.getText(), 'Saved transcript text.');
+    atoms.realtime = { item: { type: 'transcriptSegment', text: 'Canonical transcript text.' }, completed: false };
+    const live = voice('Ik', { entry: savedEntry }, 'canonical-' + compact);
+    assert.equal(live.assistant.props.item.completed, false);
+    assert.equal(speech(live.tree).length, 0);
+    atoms.realtime = { ...atoms.realtime, completed: true };
+    const finished = voice('Ik', { entry: savedEntry }, 'canonical-' + compact);
+    assert.equal(speech(finished.tree).length, 1);
+    assert.equal(speech(finished.tree)[0].props.getText(), 'Canonical transcript text.');
+    const voiceRoot = { id: 'canonical-root', html: '<p>Canonical transcript text.</p>' };
+    finished.tree.props.ref.current = { querySelector: selector => selector === '[data-selected-text-overlay-target]' ? voiceRoot : null };
+    assert.equal(speech(finished.tree)[0].props.getRoot(), voiceRoot);
+    assert.equal(speech(finished.tree)[0].props.getHtml(), voiceRoot.html);
+    const user = voice('Ik', { entry: { ...savedEntry, role: 'user' } }, 'canonical-user-' + compact);
+    assert.equal(user.assistant, undefined);
+    assert.equal(nodes(user.route, 'Uy')[0].props.hideActions, true);
+    const presentation = { type: 'inline-markdown', itemId: 'research-item', presentationId: 'research-presentation',
+      turnId: 'research-turn', content: '## Saved research\n\n| Name | Result |\n| --- | --- |\n| One | Ready |', completed: true };
+    atoms.item = undefined; atoms.turn = undefined;
+    const research = voice('Ek', { presentation }, 'research-' + compact);
+    assert.equal(research.action, undefined);
+    assert.equal(speech(research.tree).length, 1);
+    assert.equal(speech(research.tree)[0].props.getText(), presentation.content);
+    atoms.item = { type: 'agentMessage', text: '::codex-realtime-inline{}\n## Current research\n\nA revised table.' };
+    atoms.turn = 'inProgress';
+    const pending = voice('Ek', { presentation, historyEntityKey: 'canonical-turn' }, 'research-' + compact);
+    assert.equal(pending.assistant.props.item.completed, false);
+    assert.equal(speech(pending.tree).length, 0);
+    atoms.turn = 'completed';
+    const completed = voice('Ek', { presentation, historyEntityKey: 'canonical-turn' }, 'research-' + compact);
+    assert.equal(speech(completed.tree).length, 1);
+    assert.equal(speech(completed.tree)[0].props.getText(), '## Current research\n\nA revised table.');
+    // Missing completion remains conservative, even with the standalone flag.
+    atoms.realtime = undefined;
+    const unknown = voice('Ik', { entry: { ...savedEntry, completed: undefined } }, 'unknown-' + compact);
+    assert.equal(speech(unknown.tree).length, 0);
+  }
+  atoms.compact = false;
+  // Reuse a Vb instance with changing eligibility but identical text. The new
+  // outer slot must not be held by the host's original compiler memo cache.
+  for (const enabled of [false, true, false]) {
+    const rendered = response({ showActionRow: false, readAloudStandalone: enabled }, 'reuse-eligibility');
+    assert.equal(speech(rendered.tree).length, enabled ? 1 : 0);
+  }
   process.stdout.write('Host renderer boundaries verified\n');
 });

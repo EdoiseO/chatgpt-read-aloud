@@ -89,11 +89,16 @@ def fixture():
         host_hash = hashlib.sha256(host.encode()).hexdigest()
         with patch.object(speech_host, 'TOOLBAR_SHA256', host_hash):
             asset = speech_host.append_payload(speech_host.patch_toolbar(host), payload)
+        timeline = '\n'.join(before for _label, before, _after in speech_host.VOICE_TIMELINE_PATCHES)
+        timeline_hash = hashlib.sha256(timeline.encode()).hexdigest()
+        with patch.object(speech_host, 'VOICE_TIMELINE_SHA256', timeline_hash):
+            patched_timeline = speech_host.patch_voice_timeline(timeline)
         menu_source = update_menu.ORIGINAL_MENU_ITEM + '\n' + update_menu.ORIGINAL_MENU_LIST
         menu_hash = hashlib.sha256(menu_source.encode()).hexdigest()
         with patch.object(update_menu, 'HOST_MENU_SHA256', menu_hash):
             patched_menu = update_menu.patch_update_menu(menu_source)
         files = {verify.ASSET: asset.encode(),
+                 verify.VOICE_TIMELINE_ASSET: patched_timeline.encode(),
                  verify.SELECTION_ASSET: (verify.SELECTION_BUTTON + '\nreadAloudRoot:u,readAloudRange:l').encode(),
                  verify.EARLY: b'require("./local-read-aloud-main.cjs");',
                  verify.PRELOAD: b'exposeInMainWorld("codexLocalReadAloud" /* sentenceRanges */',
@@ -109,7 +114,8 @@ def fixture():
                 'CFBundleShortVersionString': verify.VERSION, 'CodexReadAloudVoicePickerVersion': 1,
                 'CodexReadAloudSelectionHighlightVersion': 1, 'CodexReadAloudSkipCodeBlocksVersion': 1,
                 'CodexReadAloudLauncherVersion': 3, 'CodexReadAloudUpdaterPolicyVersion': 2,
-                'CodexReadAloudUpdateCheckerVersion': 1, 'CodexReadAloudSpeechHostAdapterVersion': 1,
+                'CodexReadAloudUpdateCheckerVersion': 1,
+                'CodexReadAloudSpeechHostAdapterVersion': speech_host.ADAPTER_VERSION,
                 'SUEnableAutomaticChecks': False, 'SUAutomaticallyUpdate': False,
                 'SUAllowsAutomaticUpdates': False, 'ElectronAsarIntegrity': integrity,
                 'LSEnvironment': {'CODEX_ELECTRON_USER_DATA_PATH': str(runtime.parent / 'user-data'),
@@ -130,6 +136,7 @@ def fixture():
         with patch.dict(HOST_GATE_ASSETS, {key: hashlib.sha256(value).hexdigest()
                                           for key, value in gate_files.items()}, clear=True), \
                 patch.object(speech_host, 'TOOLBAR_SHA256', host_hash), \
+                patch.object(speech_host, 'VOICE_TIMELINE_SHA256', timeline_hash), \
                 patch.object(update_menu, 'HOST_MENU_SHA256', menu_hash):
             yield SimpleNamespace(root=root, app=app, home=home, source=source, runtime=runtime,
                                   archive=archive, info=info, info_path=info_path, files=files,
@@ -150,10 +157,11 @@ class VerifierTests(unittest.TestCase):
             self.assertTrue(report['voiceChoiceInformational'])
             self.assertEqual(report['voiceChoice'], 'af_aoede')
             self.assertEqual(report['availableVoiceCount'], 2)
-            self.assertEqual(report['packedAssetsVerified'], 9)
+            self.assertEqual(report['packedAssetsVerified'], 10)
             self.assertTrue(report['manualUpdateCheckVerified'])
             self.assertTrue(report['realtimeReadingControlsVerified'])
             self.assertTrue(report['persistentReadingControlsVerified'])
+            self.assertFalse(report['desktopBehaviorVerified'])
             self.assertTrue(report['updaterPolicy']['hostUpdaterDisabled'])
             self.assertTrue(report['updaterPolicy']['manualUpdatesBlocked'])
             self.assertTrue(report['speechHostAdapter']['realtimeAssistantControls'])
@@ -241,11 +249,11 @@ class VerifierTests(unittest.TestCase):
     def test_corruption_fails_with_normal_optimized_and_environment_optimized_python(self):
         code = ('from pathlib import Path; import sys,json; import verify_voice_build as v; '
                 'import updater_host_gate as g; g.HOST_GATE_ASSETS.update(json.loads(sys.argv[4])); '
-                'import speech_host_adapter as s; s.TOOLBAR_SHA256=sys.argv[5]; '
+                'import speech_host_adapter as s; s.TOOLBAR_SHA256=sys.argv[5]; s.VOICE_TIMELINE_SHA256=sys.argv[7]; '
                 'v.verify_build(Path(sys.argv[1]),home=Path(sys.argv[2]),source_root=Path(sys.argv[3]),'
                 'runner=lambda *a,**k:None)')
         code = code.replace('v.verify_build(', 'import update_menu_adapter as m; m.HOST_MENU_SHA256=sys.argv[6]; v.verify_build(')
-        for mutation in ('valid', 'identity', 'marker', 'update_marker', 'stale_checker', 'header', 'truncated', 'block_size', 'stale_worker', 'voice'):
+        for mutation in ('valid', 'identity', 'marker', 'speech_marker', 'update_marker', 'stale_checker', 'header', 'truncated', 'block_size', 'stale_worker', 'voice'):
             with self.subTest(mutation=mutation), fixture() as data:
                 if mutation == 'identity':
                     data.info['CFBundleIdentifier'] = 'wrong'
@@ -253,6 +261,8 @@ class VerifierTests(unittest.TestCase):
                     data.info['CodexReadAloudSkipCodeBlocksVersion'] = 0
                 elif mutation == 'update_marker':
                     data.info['CodexReadAloudUpdateCheckerVersion'] = False
+                elif mutation == 'speech_marker':
+                    data.info['CodexReadAloudSpeechHostAdapterVersion'] = 1
                 elif mutation == 'stale_checker':
                     (data.source / 'update-checker.cjs').write_text('/* another checker */')
                 elif mutation == 'header':
@@ -279,7 +289,7 @@ class VerifierTests(unittest.TestCase):
                         environment['PYTHONOPTIMIZE'] = optimized
                     result = subprocess.run([sys.executable, *flag, '-c', code, str(data.app), str(data.home),
                                              str(data.source), json.dumps(HOST_GATE_ASSETS), speech_host.TOOLBAR_SHA256,
-                                             update_menu.HOST_MENU_SHA256],
+                                             update_menu.HOST_MENU_SHA256, speech_host.VOICE_TIMELINE_SHA256],
                                             cwd=verify.ROOT, env=environment, capture_output=True, text=True, timeout=5)
                     if mutation == 'valid':
                         self.assertEqual(result.returncode, 0, result.stderr)
