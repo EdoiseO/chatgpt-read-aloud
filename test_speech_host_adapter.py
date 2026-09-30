@@ -55,15 +55,17 @@ class SpeechHostTests(unittest.TestCase):
 
     def test_voice_timeline_is_pinned_and_only_assistant_routes_opt_in(self):
         source = '\n'.join(before for _label, before, _after in adapter.VOICE_TIMELINE_PATCHES)
-        source += '\n/* unrelated showActionRow:!1 and user hideActions:!0 */'
+        source += '\n/* unrelated showActionRow:!1 and user hideActions:!0 */\nexport{}'
         with self.assertRaisesRegex(ValueError, 'renderer changed'):
             adapter.patch_voice_timeline(source)
         with patch.object(adapter, 'VOICE_TIMELINE_SHA256', hashlib.sha256(source.encode()).hexdigest()):
             result = adapter.patch_voice_timeline(source)
-            self.assertEqual(result.count('readAloudStandalone:!0'), 2)
+            self.assertEqual(result.count('readAloudStandalone:!a.codexReadAloudGrouped'), 1)
+            self.assertEqual(result.count('readAloudStandalone:!o.codexReadAloudGrouped'), 1)
             self.assertEqual(result.count('showActionRow:!1'), source.count('showActionRow:!1'))
             self.assertTrue(adapter.validate_patched_voice_timeline(result)['historicalVoiceWorkControls'])
-            for changed in (result + ' ', result.replace('readAloudStandalone:!0', 'readAloudStandalone:!1', 1)):
+            for changed in (result + ' ', result.replace('readAloudStandalone:!a.codexReadAloudGrouped', 'readAloudStandalone:!1', 1),
+                            result.replace(adapter.GROUP_START, '')):
                 with self.assertRaises(ValueError):
                     adapter.validate_patched_voice_timeline(changed)
 
@@ -75,7 +77,7 @@ class SpeechHostTests(unittest.TestCase):
                         self.assertRaisesRegex(ValueError, 'reviewed speech host'):
                     adapter.patch_voice_timeline(changed)
 
-    def actual_host_inputs(self):
+    def actual_host_inputs(self, include_groups=False):
         official = Path('/Applications/ChatGPT.app/Contents/Resources/app.asar')
         if not official.is_file():
             self.skipTest('Official host unavailable; proprietary source is not bundled')
@@ -106,6 +108,19 @@ class SpeechHostTests(unittest.TestCase):
         for name, boundary in [('Ik', 'var Lk,Rk;'), ('Ek', 'function Dk('), ('Dk', 'function Ok(')]:
             start = patched_voice.index('function ' + name + '(')
             functions[name] = patched_voice[start:patched_voice.index(boundary, start)]
+        if include_groups:
+            for name, following in [('BD', 'VD'), ('eO', 'tO'), ('aO', 'oO'), ('oO', 'sO'),
+                                    ('lO', 'uO'), ('Fk', 'Ik'), ('iA', 'aA'), ('Tk', 'Ek'),
+                                    ('fk', 'pk'), ('LA', 'RA'), ('ij', 'aj')]:
+                start = patched_voice.index('function ' + name + '(')
+                functions[name] = patched_voice[start:patched_voice.index('function ' + following + '(', start)]
+            functions['group_payload'] = adapter.group_payload()
+            navigation = next(after for label, _before, after in adapter.VOICE_TIMELINE_PATCHES
+                              if label == 'Resolve grouped navigation keys')
+            functions['navigation'] = 'function actualNavigationAliases(Yt){' + navigation + '}'
+            start = patched_voice.index('D=S!=null&&`type`in S&&')
+            phase = patched_voice[start:patched_voice.index(',t[2]=E', start)]
+            functions['phase'] = 'function actualLatestPhase(S,E){let D;' + phase + ';return D}'
         return functions, css
 
     @unittest.skipUnless(shutil.which('node'), 'Node is required for the host renderer probe')
@@ -129,6 +144,14 @@ class SpeechHostTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr[-4000:])
         self.assertIn('Host action layout verified in an offline browser', result.stdout)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is required for the host voice grouping probe')
+    def test_actual_canonical_projection_group_rendering_and_navigation(self):
+        functions, _css = self.actual_host_inputs(include_groups=True)
+        result = subprocess.run(['node', 'test-support/voice-group-host-probe.cjs'],
+                                input=json.dumps(functions), capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr[-5000:])
+        self.assertIn('Canonical grouped host routes verified', result.stdout)
 
 
 if __name__ == '__main__':

@@ -4,8 +4,10 @@ Keep this adapter separate from the speech engine. An upstream renderer change
 must be reviewed, including its completed-response and transcript boundaries.
 """
 import hashlib
+from pathlib import Path
+import re
 
-ADAPTER_VERSION = 3
+ADAPTER_VERSION = 4
 TOOLBAR_ASSET = 'webview/assets/sites-end-resource-ac1aa5fe0447.js'
 TOOLBAR_SHA256 = 'b812c93a6dc37c0d4069658d858a20f5430219ca916b65abdfde72a013a4a32b'
 VOICE_TIMELINE_ASSET = 'webview/assets/local-conversation-thread-b33b65c9da1e.js'
@@ -53,6 +55,8 @@ VISIBLE_RESPONSE_RETURN = ('let codexReadAloudControl=' + READ_CONTROL + ';'
                            'return(0,Y.jsxs)(`div`,{ref:jt,...Nt,className:Pt,title:Ft,'
                            'children:[It,Lt,Bt,Vt,' + SHARED_ACTION_ROW + ']})}')
 PATCHES = (
+    ('Export shared speech control', 'export{cv as $,wE as A,',
+     'export{CodexLocalReadAloudButton};export{cv as $,wE as A,'),
     ('Response speech eligibility', 'allowCopyWhileStreaming:z}=e,B=',
      'allowCopyWhileStreaming:z,readAloudStandalone:codexReadAloudStandalone}=e,B='),
     ('Move native actions beside speech', NATIVE_ACTION_ROW, 'null/* CODEX RESPONSE ACTIONS MOVED */'),
@@ -67,11 +71,59 @@ PATCHES = (
 VOICE_TIMELINE_PATCHES = (
     ('Canonical transcript assistant speech',
      'item:{type:`assistant-message`,completed:l?.completed??a.completed,content:u,phase:null,sentAtMs:null,structuredOutput:void 0},showActionRow:!1}',
-     'item:{type:`assistant-message`,completed:l?.completed??a.completed,content:u,phase:null,sentAtMs:null,structuredOutput:void 0},showActionRow:!1,readAloudStandalone:!0}'),
+     'item:{type:`assistant-message`,completed:l?.completed??a.completed,content:u,phase:null,sentAtMs:null,structuredOutput:void 0},showActionRow:!1,readAloudStandalone:!a.codexReadAloudGrouped}'),
     ('Promoted voice research speech',
      'item:v,markdownMediaCacheKey:o.presentationId,showActionRow:!1,turnId:o.turnId}',
-     'item:v,markdownMediaCacheKey:o.presentationId,showActionRow:!1,readAloudStandalone:!0,turnId:o.turnId}'),
+     'item:v,markdownMediaCacheKey:o.presentationId,showActionRow:!1,readAloudStandalone:!o.codexReadAloudGrouped,turnId:o.turnId}'),
+    ('Transcript grouping memo slot', 'function Ik(e){let t=(0,Lk.c)(19),', 'function Ik(e){let t=(0,Lk.c)(20),'),
+    ('Transcript grouping memo dependency', 't[13]!==l?.completed||t[14]!==u?',
+     't[13]!==l?.completed||t[14]!==u||t[19]!==a.codexReadAloudGrouped?'),
+    ('Transcript grouping memo value', 't[13]=l?.completed,t[14]=u,t[15]=f)',
+     't[13]=l?.completed,t[14]=u,t[15]=f,t[19]=a.codexReadAloudGrouped)'),
+    ('Exact transcript speech root', '{"data-content-search-unit-key":d,children:f}',
+     '{"data-content-search-unit-key":d,"data-codex-read-aloud-part":a.role===`assistant`&&u.trim()?`transcript:${a.id}`:void 0,'
+     '"data-codex-read-aloud-owner":a.codexReadAloudGrouped,'
+     '"data-codex-read-aloud-part-state":(l?.completed??a.completed)===!0?`complete`:`pending`,children:f}'),
+    ('Research grouping memo slot', 'function Ek(e){let t=(0,Mk.c)(27),', 'function Ek(e){let t=(0,Mk.c)(28),'),
+    ('Research grouping memo dependency', 't[20]!==o.turnId||t[21]!==v?',
+     't[20]!==o.turnId||t[21]!==v||t[27]!==o.codexReadAloudGrouped?'),
+    ('Research grouping memo value', 't[20]=o.turnId,t[21]=v,t[22]=y)',
+     't[20]=o.turnId,t[21]=v,t[22]=y,t[27]=o.codexReadAloudGrouped)'),
+    ('Exact research speech root', '{"data-content-search-turn-key":s,"data-content-search-unit-key":g,children:y}',
+     '{"data-content-search-turn-key":s,"data-content-search-unit-key":g,'
+     '"data-codex-read-aloud-part":h.trim()?`presentation:${o.presentationId}`:void 0,'
+     '"data-codex-read-aloud-owner":o.codexReadAloudGrouped,'
+     '"data-codex-read-aloud-part-state":_===!0?`complete`:`pending`,children:y}'),
+    ('Render canonical speech group', 'function Fk(e){let t=(0,Lk.c)(19),',
+     'function Fk(e){let t=(0,Lk.c)(19);if(e.block.codexReadAloudGroup)return(0,Rk.jsx)(CodexVoiceReadGroup,{entry:{...e,turnKey:e.turnSearchKey},latestTurnFooter:e.readAloudLatestTurnFooter,latestTurnFollowContentRef:e.readAloudLatestTurnFollowContentRef});let '),
+    ('Voice group footer memo slots', 'function iA(e){let t=(0,uA.c)(39),',
+     'function iA(e){let t=(0,uA.c)(41),'),
+    ('Voice group footer memo dependencies', 't[9]!==n.hostId||t[10]!==n.turnKey?',
+     't[9]!==n.hostId||t[10]!==n.turnKey||t[39]!==r||t[40]!==i?'),
+    ('Voice group footer forwarding', 'hostId:n.hostId,turnSearchKey:n.turnKey}),t[6]=n.block',
+     'hostId:n.hostId,turnSearchKey:n.turnKey,readAloudLatestTurnFooter:r,readAloudLatestTurnFollowContentRef:i}),t[6]=n.block'),
+    ('Voice group footer memo values', 't[9]=n.hostId,t[10]=n.turnKey,t[11]=e)',
+     't[9]=n.hostId,t[10]=n.turnKey,t[11]=e,t[39]=r,t[40]=i)'),
+    ('Group canonical projected responses', 'return KD(XD({entries:h,projectedEntries:x,projectedTurnIds:b}))}',
+     'return codexGroupVoiceResponses(KD(XD({entries:h,projectedEntries:x,projectedTurnIds:b})),r.timeline)}'),
+    ('Search grouped response children', 'function fk(e,t=Ea){let n=new Set;',
+     'function fk(e,t=Ea){e=codexVoiceGroupEntries(e);let n=new Set;'),
+    ('Bookmark grouped response children', 'function LA({entries:e,isConversationHistoryComplete:t}){if(!t)return BA;',
+     'function LA({entries:e,isConversationHistoryComplete:t}){if(!t)return BA;e=codexVoiceGroupEntries(e);'),
+    ('Resolve grouped navigation keys',
+     'let e=new Map;for(let t of Yt)Sg(t)&&(e.has(t.turnKey)||e.set(t.turnKey,t.turnKey),e.has(t.turnSearchKey)||e.set(t.turnSearchKey,t.turnKey),t.sourceTurnSearchKey!=null&&!e.has(t.sourceTurnSearchKey)&&e.set(t.sourceTurnSearchKey,t.turnKey));return e',
+     'let e=new Map;for(let[t,n]of codexVoiceNavigationEntries(Yt)){t.turnKey!=null&&!e.has(t.turnKey)&&e.set(t.turnKey,n);Sg(t)&&(e.has(t.turnSearchKey)||e.set(t.turnSearchKey,n),t.sourceTurnSearchKey!=null&&!e.has(t.sourceTurnSearchKey)&&e.set(t.sourceTurnSearchKey,n))}return e'),
 )
+
+GROUP_IMPORT = 'import{CodexLocalReadAloudButton}from"./sites-end-resource-ac1aa5fe0447.js";\n'
+GROUP_START = '\n/* BEGIN CODEX VOICE RESPONSE GROUPS */\n'
+GROUP_END = '\n/* END CODEX VOICE RESPONSE GROUPS */\n'
+
+
+def group_payload():
+    root = Path(__file__).resolve().parent
+    return '\n'.join(re.sub(r'^export ', '', (root / name).read_text(), flags=re.M)
+                     for name in ('voice-response-groups.mjs', 'voice-response-group-host.js'))
 
 
 def replace_once(text, before, after, description):
@@ -97,15 +149,21 @@ def patch_voice_timeline(text):
         raise ValueError('Voice history renderer changed; review compatibility before rebuilding')
     for description, before, after in VOICE_TIMELINE_PATCHES:
         text = replace_once(text, before, after, description)
-    return text
+    marker = text.rfind('export{')
+    if marker < 0:
+        raise ValueError('Voice history export boundary is missing')
+    return GROUP_IMPORT + text[:marker] + GROUP_START + group_payload() + GROUP_END + text[marker:]
 
 
 def validate_patched_voice_timeline(text):
+    text = replace_once(text, GROUP_IMPORT, '', 'Voice group component import')
+    text = replace_once(text, GROUP_START + group_payload() + GROUP_END, '', 'Voice grouping helper')
     for description, before, after in reversed(VOICE_TIMELINE_PATCHES):
         text = replace_once(text, after, before, description)
     if hashlib.sha256(text.encode()).hexdigest() != VOICE_TIMELINE_SHA256:
         raise ValueError('Voice history renderer differs from the reviewed adapter')
-    return {'historicalVoiceWorkControls': True, 'voiceTimelineSha256': VOICE_TIMELINE_SHA256}
+    return {'historicalVoiceWorkControls': True, 'canonicalVoiceResponseGrouping': True,
+            'voiceTimelineSha256': VOICE_TIMELINE_SHA256}
 
 
 def append_payload(text, payload):

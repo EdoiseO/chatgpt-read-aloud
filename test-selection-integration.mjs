@@ -31,7 +31,7 @@ async function isolated(markup, run) {
       const react = {
         useState(initial) { const index = hooks.index++, state = hooks; if (!(index in state.slots)) state.slots[index] = initial; return [state.slots[index], value => { state.slots[index] = value; }]; },
         useRef(initial) { const index = hooks.index++; if (!(index in hooks.slots)) hooks.slots[index] = { current: initial }; return hooks.slots[index]; },
-        useEffect(callback) { const index = hooks.index++; if (!hooks.effects.has(index)) { hooks.effects.set(index, callback); hooks.pending.push(index); } },
+        useEffect(callback, deps) { const index = hooks.index++, previous = hooks.effects.get(index); if (!previous || deps === undefined || deps.length !== previous.deps?.length || deps.some((dep, i) => !Object.is(dep, previous.deps[i]))) { hooks.effects.set(index, { callback, deps }); hooks.pending.push(index); } },
       };
       window.Fo = () => react;
       window.Y = window.UG = { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }), Fragment: Symbol('fragment') };
@@ -81,7 +81,7 @@ async function isolated(markup, run) {
         const state = { slots: [], effects: new Map(), cleanups: new Map(), pending: [], index: 0 };
         const host = document.createElement('div'); document.body.append(host);
         const instance = {
-          render() { hooks = state; state.index = 0; const tree = window.__actualComponent({ getRoot: () => root, getText: () => fallback.text ?? 'WRONG Markdown [copy](url)', getHtml: () => 'html' in fallback ? fallback.html : '<p>WRONG HTML</p>' }); host.replaceChildren(treeNode(tree)); for (const index of state.pending.splice(0)) state.cleanups.set(index, state.effects.get(index)()); return host; },
+          render() { hooks = state; state.index = 0; const tree = window.__actualComponent({ getRoot: () => root, getTextRoots: fallback.getTextRoots, getText: () => fallback.text ?? 'WRONG Markdown [copy](url)', getHtml: () => 'html' in fallback ? fallback.html : '<p>WRONG HTML</p>' }); host.replaceChildren(treeNode(tree)); for (const index of state.pending.splice(0)) { state.cleanups.get(index)?.(); state.cleanups.set(index, state.effects.get(index).callback()); } return host; },
           get button() { return host.querySelector('[data-codex-local-read-aloud="response"]'); },
           unmount() { for (const cleanup of state.cleanups.values()) cleanup?.(); host.remove(); },
         };
@@ -105,6 +105,134 @@ async function isolated(markup, run) {
     }, { source: sources, menu: selectionButton });
     return await page.evaluate(run);
   } finally { await context.close(); }
+}
+
+test('one grouped action reads assistant parts in DOM order and excludes work/user text', async () => {
+  const value = await isolated('<section id="group"><p data-part>Opening.</p><div>Research task finished.</div><p>User text must stay out.</p><div data-part><table><tr><td>Plan</td><td>Ready</td></tr></table><pre>hidden_code()</pre></div><p data-part>Closing.</p></section>', async () => {
+    const f = fixture, root = document.querySelector('#group');
+    const mounted = f.mount(root, { getTextRoots: () => root.querySelectorAll('[data-part]') });
+    f.fire(mounted.button, 'click'); await f.tick();
+    const request = f.starts[0]; request.resolve(f.chunk(request, 0)); await f.tick(); f.audios[0].playing(); await f.tick();
+    f.audios[0].ended(); await f.tick(); f.nexts[0].resolve(f.chunk(request, 1)); await f.tick(); f.audios[1].playing(); await f.tick();
+    const during = f.highlighted(); f.fire(mounted.button, 'click'); await f.tick(); mounted.render();
+    return { text: request.text, during, after: f.highlighted(), idle: mounted.button.getAttribute('aria-pressed'), alerts: f.alerts };
+  });
+  assert.deepEqual(value, { text: 'Opening.\n\nPlan Ready\n\nClosing.', during: 'PlanReady', after: null, idle: 'false', alerts: [] });
+});
+
+test('group action captures a selection spanning transcript and table without speaking intervening work', async () => {
+  const value = await isolated('<section id="group"><p data-part>First words.</p><div>Work finished.</div><div data-part><table><tr><td>Final words.</td></tr></table></div></section>', async () => {
+    const f = fixture, root = document.querySelector('#group'), parts = [...root.querySelectorAll('[data-part]')];
+    const mounted = f.mount(root, { getTextRoots: () => parts });
+    const range = document.createRange(); range.setStart(parts[0].firstChild, 6); range.setEnd(parts[1].querySelector('td').firstChild, 5);
+    getSelection().removeAllRanges(); getSelection().addRange(range); document.dispatchEvent(new Event('selectionchange')); mounted.render();
+    const label = mounted.button.getAttribute('aria-label');
+    f.fire(mounted.button, 'pointerdown'); getSelection().removeAllRanges(); f.fire(mounted.button, 'mousedown'); f.fire(mounted.button, 'click'); await f.tick();
+    return { label, text: f.starts[0]?.text, alerts: f.alerts };
+  });
+  assert.deepEqual(value, { label: 'Read aloud', text: 'words.\n\nFinal', alerts: [] });
+});
+
+test('floating selection inside any assistant part routes to its group and rejects work or outside roots', async () => {
+  const value = await isolated('<section id="group"><p data-part>Opening.</p><p id="work">Work status.</p><p data-part>Closing.</p></section><p id="outside">Other reply.</p>', async () => {
+    const f = fixture, root = document.querySelector('#group'), parts = [...root.querySelectorAll('[data-part]')];
+    f.mount(root, { getTextRoots: () => parts });
+    const work = document.querySelector('#work'), outside = document.querySelector('#outside');
+    const workMenu = f.menu(work, f.select(work.firstChild, 0, 4));
+    const outsideMenu = f.menu(outside, f.select(outside.firstChild, 0, 5));
+    const menu = f.menu(parts[1], f.select(parts[1].firstChild, 0, 8));
+    f.fire(menu, 'click'); await f.tick();
+    return { workMenu: !!workMenu, outsideMenu: !!outsideMenu, text: f.starts[0]?.text, alerts: f.alerts };
+  });
+  assert.deepEqual(value, { workMenu: false, outsideMenu: false, text: 'Closing.', alerts: [] });
+});
+
+test('missing, foreign, or detached group content never falls back to wrapper or copied text', async () => {
+  const value = await isolated('<section id="group"><p data-part>Allowed.</p><p>Private work text.</p></section><p id="foreign">Foreign.</p>', async () => {
+    const f = fixture, root = document.querySelector('#group'), part = root.querySelector('[data-part]');
+    let parts = [], mounted = f.mount(root, { getTextRoots: () => parts });
+    f.fire(mounted.button, 'click'); await f.tick();
+    parts = [part, document.querySelector('#foreign')]; f.fire(mounted.button, 'click'); await f.tick();
+    parts = [part]; root.remove(); f.fire(mounted.button, 'click'); await f.tick();
+    return { starts: f.starts.length, alerts: f.alerts };
+  });
+  assert.equal(value.starts, 0);
+  assert.deepEqual(value.alerts, ['Could not read this response. Please try again.']);
+});
+
+test('a group does not shadow another registered response outside its allowed text roots', async () => {
+  const value = await isolated('<section id="group"><p id="part">Group prose.</p><section id="nested"><p>Separate response.</p></section></section>', async () => {
+    const f = fixture, group = document.querySelector('#group'), nested = document.querySelector('#nested');
+    f.mount(group, { getTextRoots: () => [document.querySelector('#part')] });
+    f.mount(nested);
+    const menu = f.menu(nested, f.select(nested.querySelector('p').firstChild, 0, 18));
+    f.fire(menu, 'click'); await f.tick();
+    return { text: f.starts[0]?.text, alerts: f.alerts };
+  });
+  assert.deepEqual(value, { text: 'Separate response.', alerts: [] });
+});
+
+for (const mutation of ['membership', 'detached', 'content', 'code', 'inserted', 'hidden']) {
+  test(`group ${mutation} change while voice lookup waits cancels the captured read`, async () => {
+    const value = await isolated(`<body data-mutation="${mutation}"><section id="group"><p id="a">Original.</p><p id="b">Replacement.</p></section></body>`, async () => {
+      const f = fixture, root = document.querySelector('#group'), a = root.querySelector('#a'), b = root.querySelector('#b');
+      const props = { getTextRoots: () => [a] }, mounted = f.mount(root, props);
+      f.holdVoices(true); f.fire(mounted.button, 'click'); await f.tick();
+      // The mode is encoded on the page by the test wrapper below.
+      const mode = document.body.dataset.mutation;
+      if (mode === 'membership') props.getTextRoots = () => [b];
+      else if (mode === 'detached') root.remove();
+      else if (mode === 'code') a.setAttribute('data-markdown-copy', 'code-block');
+      else if (mode === 'inserted') a.append(document.createTextNode(' More text.'));
+      else if (mode === 'hidden') a.hidden = true;
+      else a.firstChild.data = 'Changed.';
+      mounted.render(); f.voiceJobs[0].resolve({ selectedVoice: 'af_aoede' }); await f.tick();
+      return { starts: f.starts.length, alerts: f.alerts };
+    });
+    assert.deepEqual(value, { starts: 0, alerts: ['The response changed. Please read it again.'] });
+  });
+}
+
+test('group ownership changes after capture or during playback cannot use stale parts/highlights', async () => {
+  const value = await isolated('<section id="group"><p id="a">Original.</p><p id="b">Replacement.</p></section>', async () => {
+    const f = fixture, root = document.querySelector('#group'), a = root.querySelector('#a'), b = root.querySelector('#b');
+    let parts = [a]; const mounted = f.mount(root, { getTextRoots: () => parts });
+    f.select(a.firstChild, 0, 9); f.fire(mounted.button, 'pointerdown'); parts = [b]; getSelection().removeAllRanges();
+    f.fire(mounted.button, 'click'); await f.tick(); const staleStarts = f.starts.length;
+    f.fire(mounted.button, 'click'); await f.tick(); const request = f.starts[0];
+    request.resolve(f.chunk(request)); await f.tick(); f.audios[0].playing(); await f.tick(); const initialHighlight = f.highlighted();
+    parts = [a]; mounted.render(); await f.tick();
+    return { staleStarts, initialHighlight, highlight: f.highlighted(), paused: f.audios[0].paused, canceled: f.cancels.includes(request.id), alerts: f.alerts };
+  });
+  assert.deepEqual(value, { staleStarts: 0, initialHighlight: 'Replacement.', highlight: null, paused: true, canceled: true, alerts: ['The response changed. Please read it again.'] });
+});
+
+test('a playing group stops immediately when its readable content becomes excluded without a rerender', async () => {
+  const value = await isolated('<section id="group"><p id="part">Visible prose.</p></section>', async () => {
+    const f = fixture, root = document.querySelector('#group'), part = root.querySelector('#part');
+    const mounted = f.mount(root, { getTextRoots: () => [part] });
+    f.fire(mounted.button, 'click'); await f.tick(); const request = f.starts[0];
+    request.resolve(f.chunk(request)); await f.tick(); f.audios[0].playing(); await f.tick();
+    part.setAttribute('data-markdown-copy', 'code-block'); await f.tick();
+    return { highlight: f.highlighted(), paused: f.audios[0].paused, canceled: f.cancels.includes(request.id), alerts: f.alerts };
+  });
+  assert.deepEqual(value, { highlight: null, paused: true, canceled: true, alerts: [] });
+});
+
+for (const attribute of ['data-codex-read-aloud-owner', 'data-codex-read-aloud-part-state']) {
+  test(`child-only ${attribute} changes stop group playback without a footer rerender`, async () => {
+    const value = await isolated(`<body data-change="${attribute}"><section id="group"><div id="part" data-codex-read-aloud-owner="group" data-codex-read-aloud-part-state="complete"><p>Owned prose.</p></div></section></body>`, async () => {
+      const f = fixture, root = document.querySelector('#group'), part = root.querySelector('#part');
+      const mounted = f.mount(root, { getTextRoots: () =>
+        part.getAttribute('data-codex-read-aloud-owner') === 'group' &&
+        part.getAttribute('data-codex-read-aloud-part-state') === 'complete' ? [part.querySelector('p')] : [] });
+      f.fire(mounted.button, 'click'); await f.tick(); const request = f.starts[0];
+      request.resolve(f.chunk(request)); await f.tick(); f.audios[0].playing(); await f.tick();
+      part.setAttribute(document.body.dataset.change, 'changed'); await f.tick();
+      return { highlight: f.highlighted(), paused: f.audios[0].paused, canceled: f.cancels.includes(request.id), alerts: f.alerts };
+    });
+    assert.deepEqual(value, { highlight: null, paused: true, canceled: true, alerts: [] });
+  });
 }
 
 test('pointer capture survives focus/selection loss before mousedown and click', async () => {

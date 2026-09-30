@@ -55,10 +55,11 @@ function fixture() {
       if (!(index in hooks.slots)) hooks.slots[index] = `test-id-${index}`;
       return hooks.slots[index];
     },
-    useEffect(callback) {
+    useEffect(callback, deps) {
       const index = hooks.index++;
-      if (!hooks.effects.has(index)) {
-        hooks.effects.set(index, callback);
+      const previous = hooks.effects.get(index);
+      if (!previous || deps === undefined || deps.length !== previous.deps?.length || deps.some((dep, i) => !Object.is(dep, previous.deps[i]))) {
+        hooks.effects.set(index, { callback, deps });
         hooks.toMount.push(index);
       }
     },
@@ -93,7 +94,10 @@ function fixture() {
             focus() { document.activeElement = this; }, querySelectorAll() { return []; },
           };
         });
-        for (const index of state.toMount.splice(0)) state.cleanups.set(index, state.effects.get(index)());
+        for (const index of state.toMount.splice(0)) {
+          state.cleanups.get(index)?.();
+          state.cleanups.set(index, state.effects.get(index).callback());
+        }
         return tree;
       },
       unmount() { for (const cleanup of state.cleanups.values()) cleanup?.(); },

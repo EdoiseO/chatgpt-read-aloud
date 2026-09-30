@@ -26,11 +26,28 @@ component licenses.
 
 ## Reading behavior
 
-Reading controls sit outside the host's hover-only action group. Completed
-voice-session transcripts and associated research output have a separate speech
-row because the host suppresses its normal toolbar on those entries. They use
-the same response component and scoped text mapper. User messages, empty
-responses, streaming replies, and silent automation completions remain excluded.
+Reading controls sit outside the host's hover-only action group. In the canonical
+voice timeline, assistant transcript segments and promoted Markdown research
+belonging to one reply share a single reading and voice-selection row. User
+messages, session boundaries, and ordinary conversation entries separate groups.
+Work cards and artifacts keep their native rendering; only the explicitly marked
+assistant prose and research roots contribute speech.
+
+A group becomes readable after its boundary closes and all its speech parts
+finish. An open trailing reply, the partial reply at the start of a history page,
+active work, or an unresolved promoted artifact keeps the group controls hidden.
+The earlier voice renderer retains controls on individual entries. Ordinary
+responses keep their existing action row. User messages, empty responses,
+streaming replies, and silent automation completions remain excluded.
+
+The group button can read a selection spanning its transcript and research
+parts, omitting intervening work text. The host's floating selection action works
+inside any one readable part. Selections outside the group's approved roots
+cannot become grouped speech. Missing roots never fall back to copied text;
+changed ownership or content invalidates queued reads and stops active grouped
+playback. Search and bookmarks retain the child entries, with navigation keys
+mapped to the enclosing rendered group.
+
 The speech host adapter pins both the response renderer and the voice timeline
 renderer, and verifies their complete contents after reversing the patch.
 
@@ -116,10 +133,12 @@ node --test test-kokoro-runtime.cjs
 Those checks preserve the live voice settings. Valid generated audio and source
 tests do not replace the [manual audible UI checks](INSTALLATION.md#check-the-feature-in-the-actual-app).
 The bundle verifier checks integration bytes and signatures; it does not prove
-that controls render in every desktop view. The local host probe covers the
-legacy transcript renderer and the newer voice timeline's transcript and research
-routes, including hidden native toolbars. Desktop checks must also exercise saved
-voice sessions after restarting the app.
+that controls render in every desktop view. The local host probes execute the
+pinned legacy renderer and canonical voice projection, transcript, and research
+functions with fixture data and inert dependencies. Group tests cover user and
+session boundaries, incomplete history, pending research, search, bookmarks, and
+requested navigation keys. They do not verify physical scrolling or the complete
+live desktop rendering lifecycle.
 The local layout probe renders the pinned host row structure with its original
 CSS in an offline browser. It checks that native and speech controls share one
 row, speech stays visible, and hover/focus do not shift the controls. Complex
@@ -127,6 +146,11 @@ widgets are inert boxes in this probe, so the actual desktop layout still needs
 verification after activation.
 The original personal installation has been manually checked for playback,
 stopping, switching responses, reopening, selection reading, and highlighting.
+Those earlier checks do not validate the new grouped voice UI. After activation,
+reopen saved voice sessions and check one control row per completed reply,
+transcript-to-table selection through that row, stop/switch behavior, search and
+bookmark navigation, and separation at user and session boundaries. Check narrow
+windows and long research replies in the actual app as well.
 Fresh bootstrap/install helpers are separately tested with isolated fixtures;
 installation on a second Mac has not yet been confirmed.
 
@@ -144,6 +168,7 @@ The source layout is deliberately small:
 | `updater_policy.py`, `updater_host_gate.py` | Custom updater policy and pinned host support |
 | `update-checker.cjs`, `update_menu_adapter.py` | Manual official-release discovery and pinned menu integration |
 | `speech_host_adapter.py` | Pinned response layout and transcript integration |
+| `voice-response-groups.mjs`, `voice-response-group-host.js` | Canonical voice reply boundaries, grouped rendering, and exact speech roots |
 | `launch_registration.py` | Constrained macOS app-registration reconciliation |
 | `install_fresh.py`, `apply_voice_upgrade.py` | Fresh installation and guarded staged updates |
 

@@ -15,6 +15,7 @@ from updater_host_gate import HOST_GATE_ASSETS, validate_host_gate_assets
 from speech_host_adapter import (ADAPTER_VERSION, TOOLBAR_ASSET, VOICE_TIMELINE_ASSET,
                                  patch_toolbar, patch_voice_timeline, append_payload)
 from update_menu_adapter import HOST_MENU_ASSET, UPDATE_MAIN, patch_update_menu
+from signing_identity import record_signing_identity, resolve_signing_identity, sign_bundle
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = Path('/Applications/ChatGPT.app')
@@ -126,6 +127,8 @@ def main():
                         help='Regenerate only the existing guarded experimental copy')
     parser.add_argument('--target', type=Path,
                         help='Explicit scratch-stage bundle path; installed apps are refused')
+    parser.add_argument('--signing-identity',
+                        help='Opt in to an existing certificate using its exact 40-digit SHA-1 fingerprint')
     args = parser.parse_args()
     if args.target:
         TARGET = args.target.expanduser().absolute()
@@ -147,6 +150,7 @@ def main():
     # Check the original framework before making any copy changes.
     patch_integrity_slot((SOURCE / FRAMEWORK).read_bytes(), original_integrity, original_integrity)
     previous_integrity = original_integrity
+    signing_identity = None
     if args.refresh_copy:
         validate_copy_paths()
         previous_info = plistlib.loads((TARGET / 'Contents/Info.plist').read_bytes())
@@ -154,6 +158,8 @@ def main():
             raise SystemExit('Refusing to refresh a bundle with an unexpected identity')
         if previous_info.get('CFBundleShortVersionString') != VERSION:
             raise SystemExit('Refusing to refresh a copy with an unexpected version')
+        signing_identity = resolve_signing_identity(args.signing_identity, info=previous_info,
+                                                    app=TARGET, runner=subprocess.run)
         previous_integrity = copy.deepcopy(previous_info['ElectronAsarIntegrity'])
         # Keep the installed copy bound to its permanent profile after a refresh.
         profile = previous_info.get('LSEnvironment', {}).get('CODEX_ELECTRON_USER_DATA_PATH')
@@ -162,6 +168,9 @@ def main():
         if previous_info.get('CodexReadAloudLauncherVersion'):
             info['CodexReadAloudLauncherVersion'] = previous_info['CodexReadAloudLauncherVersion']
         patch_integrity_slot((TARGET / FRAMEWORK).read_bytes(), previous_integrity, previous_integrity)
+    else:
+        signing_identity = resolve_signing_identity(args.signing_identity, runner=subprocess.run)
+    record_signing_identity(info, signing_identity)
     original = SOURCE / RESOURCE
     with original.open('rb') as stream:
         tree, raw, body = read_header(stream)
@@ -277,9 +286,9 @@ def main():
     entitlements['com.apple.security.cs.disable-library-validation'] = True
     entitlement_file = ROOT / 'local-entitlements.plist'
     entitlement_file.write_bytes(plistlib.dumps(entitlements))
-    subprocess.run(['codesign', '--force', '--deep', '--sign', '-', '--preserve-metadata=flags', '--entitlements', str(entitlement_file), str(TARGET)], check=True)
-    subprocess.run(['codesign', '--verify', '--deep', '--strict', str(TARGET)], check=True)
+    signing = sign_bundle(TARGET, entitlement_file, signing_identity, runner=subprocess.run)
     print(f'Built experimental copy: {TARGET}')
+    print('Signing identity: ' + json.dumps(signing, sort_keys=True))
     print('Official app unchanged. Use the experimental copy with its dedicated profile launcher.')
 
 if __name__ == '__main__':

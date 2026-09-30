@@ -17,6 +17,7 @@ import configure_launcher as launcher
 import runtime_voices as voices
 import updater_policy as policy
 from test_verify_voice_build import fixture as build_fixture
+from test_signing_identity import signature_output
 
 ROOT = Path(__file__).resolve().parent
 
@@ -247,7 +248,9 @@ class ConfigureLauncherPolicyTests(unittest.TestCase):
             commands.append(arguments)
             if arguments[0] == 'xcrun':
                 Path(arguments[-1]).write_bytes(b'fixture compiled launcher')
-            return SimpleNamespace(returncode=0, stdout='', stderr='')
+            return SimpleNamespace(returncode=0,
+                                   stdout=signature_output(arguments[-1]) if '--display' in arguments else '',
+                                   stderr='')
         profile = data.runtime.parent / 'user-data'
         with patch.object(launcher.subprocess, 'run', side_effect=runner), patch('builtins.print'):
             launcher.main(data.app, profile=profile, refresh_launcher=refresh)

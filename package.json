@@ -5,7 +5,7 @@
   "description": "Local Kokoro reading aid for an experimental macOS desktop copy",
   "scripts": {
     "test": "npm run test:unit && npm run test:browser",
-    "test:unit": "node --test test-speech-controller.mjs test-kokoro-response-speaker.mjs test-kokoro-main.cjs test-response-button.cjs test-update-checker.cjs",
+    "test:unit": "node --test test-speech-controller.mjs test-kokoro-response-speaker.mjs test-kokoro-main.cjs test-response-button.cjs test-update-checker.cjs test-voice-response-groups.mjs",
     "test:browser": "node --test test-response-highlight.mjs test-selection-integration.mjs",
     "demo:prepare": "node scripts/prepare_demo.mjs",
     "demo:capture": "node scripts/capture_demo.mjs"

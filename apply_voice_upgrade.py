@@ -23,6 +23,7 @@ import signal
 import stat
 import struct
 import subprocess
+from signing_identity import verify_signing_identity, verify_signing_transition
 import sys
 import tempfile
 import time
@@ -220,7 +221,7 @@ def verify_bundle(config, bundle, expected_version=None, require_upgrade=False, 
         # host's updater gate or that this exact host build honors the gate.
         # Saved preference conflicts are migrated only after the app quits.
         report_update_policy(bundle)
-    checked_run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(bundle)], runner)
+    info['_signingIdentity'] = verify_signing_identity(bundle, info=info, runner=runner)
     framework = contained_path(bundle, Path('Contents/Frameworks/Codex Framework.framework/Versions/Current/Codex Framework'))
     integrity = info['ElectronAsarIntegrity']
     patch_integrity_slot(framework.read_bytes(), integrity, integrity)
@@ -850,6 +851,8 @@ def verify_runtime_worker(config, readiness):
 def preflight(config, verify=verify_bundle, runner=subprocess.run):
     installed = verify(config, config.target)
     staged = verify(config, config.stage, installed['CFBundleShortVersionString'], True)
+    staged['_signingTransition'] = verify_signing_transition(
+        config.target, config.stage, installed['_signingIdentity'], staged['_signingIdentity'], runner=runner)
     if config.verification_report.is_symlink() or not config.verification_report.is_file():
         raise RuntimeError('The staged voice-build verification report is not ready.')
     readiness = json.loads(config.verification_report.read_text())
@@ -865,6 +868,7 @@ def preflight(config, verify=verify_bundle, runner=subprocess.run):
             or not isinstance(readiness.get('packedAssetsVerified'), int)
             or readiness['packedAssetsVerified'] < 1
             or readiness.get('asarHeaderHash') != staged['ElectronAsarIntegrity']['Resources/app.asar']['hash']
+            or readiness.get('signingIdentity') != staged['_signingIdentity']
             or readiness.get('mainModuleHash') != staged.get('_mainModuleHash')):
         raise RuntimeError('The staged voice-build verification report does not match this ready build.')
     verify_runtime_worker(config, readiness)
@@ -968,6 +972,8 @@ def apply_upgrade(config, wait_seconds=1800, verify=verify_bundle, blockers=proc
                   'stagedAsarHeaderHash': staged['ElectronAsarIntegrity']['Resources/app.asar']['hash'],
                   'previousBundleIdentityHash': installed['_bundleIdentityHash'],
                   'stagedBundleIdentityHash': staged['_bundleIdentityHash'],
+                  'signingIdentity': staged['_signingIdentity'],
+                  'signingTransition': staged['_signingTransition'],
                   'unchangedDockResourceHashes': dock_hashes,
                   'unchangedCuaSubtreeManifest': cua_manifest,
                   'retainedResourceBackupAliases': [str(alias) for alias in retained],

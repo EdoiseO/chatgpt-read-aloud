@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import apply_voice_upgrade as upgrade
 import runtime_voices
+from test_signing_identity import fixture_report, PIN, OTHER_PIN
 
 
 HEADER_HASH = 'a' * 64
@@ -74,6 +75,7 @@ def fixture():
                   'voicePickerHooksVerified': True, 'selectionHighlightHooksVerified': True,
                   'manualUpdateCheckVerified': True, 'realtimeReadingControlsVerified': True,
                   'persistentReadingControlsVerified': True,
+                  'signingIdentity': fixture_report(),
                   'runtimeWorkerPath': str(worker), 'runtimeWorkerHash': hashlib.sha256(worker.read_bytes()).hexdigest(),
                   'asarHeaderHash': HEADER_HASH, 'mainModuleHash': MAIN_HASH}
         config.verification_report.write_text(json.dumps(report))
@@ -106,6 +108,7 @@ def fake_verify(config, bundle, version=None, require_upgrade=False):
             'CodexReadAloudSelectionHighlightVersion': 1,
             'ElectronAsarIntegrity': {'Resources/app.asar': {'hash': {'old': OLD_HEADER_HASH, 'newer': 'e' * 64}.get((bundle / 'marker').read_text(), HEADER_HASH)}},
             '_bundleIdentityHash': hashlib.sha256(b'fixture-bundle:' + (bundle / 'marker').read_bytes()).hexdigest(),
+            '_signingIdentity': fixture_report(),
             '_mainModuleHash': MAIN_HASH}
 
 
@@ -192,6 +195,73 @@ def atomic_record(config):
 
 
 class ActivationTests(unittest.TestCase):
+    def test_pinned_preflight_rejects_signer_change_or_adhoc_downgrade(self):
+        for new_pin in (None, OTHER_PIN):
+            with self.subTest(new_pin=new_pin), fixture() as config:
+                def verify(cfg, bundle, *args):
+                    info = fake_verify(cfg, bundle, *args)
+                    info['_signingIdentity'] = fixture_report(PIN if bundle == cfg.target else new_pin)
+                    return info
+                with self.assertRaisesRegex(RuntimeError, 'changes or removes'):
+                    upgrade.preflight(config, verify, successful_runner)
+                self.assertEqual((config.target / 'marker').read_text(), 'old')
+                self.assertFalse(config.report.exists())
+
+    def test_pinned_preflight_requires_both_directions_for_root_and_native_dr(self):
+        with fixture() as config:
+            report = json.loads(config.verification_report.read_text())
+            report['signingIdentity'] = fixture_report(PIN)
+            config.verification_report.write_text(json.dumps(report))
+            def verify(cfg, bundle, *args):
+                return {**fake_verify(cfg, bundle, *args), '_signingIdentity': fixture_report(PIN)}
+            commands = []
+            def runner(args, **kwargs):
+                commands.append(args)
+                return successful_runner(args, **kwargs)
+            installed, staged = upgrade.preflight(config, verify, runner)
+            self.assertEqual(len([args for args in commands if '-R' in args]), 4)
+            self.assertTrue(staged['_signingTransition']['mutuallyCompatibleRequirements'])
+            def incompatible(args, **kwargs):
+                if '-R' in args:
+                    raise RuntimeError('Fixture incompatible designated requirement')
+                return successful_runner(args, **kwargs)
+            with self.assertRaisesRegex(RuntimeError, 'incompatible designated requirement'):
+                upgrade.preflight(config, verify, incompatible)
+
+    def test_explicit_certificate_migration_is_reported_and_old_adhoc_rollback_remains_available(self):
+        for fail_startup in (False, True):
+            with self.subTest(fail_startup=fail_startup), fixture() as config:
+                report = json.loads(config.verification_report.read_text())
+                report['signingIdentity'] = fixture_report(PIN)
+                config.verification_report.write_text(json.dumps(report))
+                def verify(cfg, bundle, *args):
+                    info = fake_verify(cfg, bundle, *args)
+                    info['_signingIdentity'] = fixture_report(None if (bundle / 'marker').read_text() == 'old' else PIN)
+                    return info
+                def startup(cfg):
+                    if fail_startup:
+                        raise RuntimeError('Fixture startup failure')
+                    return 123
+                if fail_startup:
+                    with self.assertRaisesRegex(RuntimeError, 'previous app was restored'):
+                        upgrade.apply_upgrade(config, verify=verify, blockers=lambda _: [], wait=no_wait,
+                                              launch=lambda _: None, startup=startup, runner=successful_runner)
+                    self.assertEqual((config.target / 'marker').read_text(), 'old')
+                else:
+                    upgrade.apply_upgrade(config, verify=verify, blockers=lambda _: [], wait=no_wait,
+                                          launch=lambda _: None, startup=startup, runner=successful_runner)
+                activation = json.loads(config.report.read_text())
+                self.assertEqual(activation['signingTransition']['kind'], 'adhoc-to-certificate')
+                self.assertTrue(activation['signingTransition']['permissionsMayNeedApproval'])
+
+    def test_stale_signing_report_is_rejected_even_when_archive_hash_matches(self):
+        with fixture() as config:
+            report = json.loads(config.verification_report.read_text())
+            report['signingIdentity']['app']['designatedRequirement'] = 'identifier "different"'
+            config.verification_report.write_text(json.dumps(report))
+            with self.assertRaisesRegex(RuntimeError, 'does not match'):
+                upgrade.preflight(config, fake_verify, successful_runner)
+
     def test_readiness_requires_update_check_and_persistent_realtime_reading_verification(self):
         for flag in ('manualUpdateCheckVerified', 'realtimeReadingControlsVerified', 'persistentReadingControlsVerified'):
             for value in (None, False, 1):

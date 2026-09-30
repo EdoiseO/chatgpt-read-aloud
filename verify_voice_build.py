@@ -17,6 +17,7 @@ import subprocess
 
 from asar_integrity import patch_integrity_slot
 from build_copy import ASSET, SELECTION_ASSET, SELECTION_BUTTON, EARLY, PRELOAD, MAIN, FRAMEWORK, RESOURCE, VERSION
+from signing_identity import verify_signing_identity
 from runtime_voices import read_saved_voice, supported_voice_ids
 from updater_host_gate import HOST_GATE_ASSETS, validate_host_gate_assets
 from speech_host_adapter import (ADAPTER_VERSION, VOICE_TIMELINE_ASSET, ROOT_ROUTING,
@@ -198,8 +199,8 @@ def verify_build(app, *, home=None, official=Path('/Applications/ChatGPT.app'), 
                 and updater.get('savedPreferencesConflict') is False,
                 'Installed custom updater preferences must disable automatic checks and downloads')
         updater['effectivePreferences'] = verify_effective_preferences(runner)
-    for target in (app, official):
-        runner(['codesign', '--verify', '--deep', '--strict', str(target)], check=True)
+    runner(['codesign', '--verify', '--deep', '--strict', str(official)], check=True)
+    signing = verify_signing_identity(app, info=info, runner=runner)
     patch_integrity_slot((app / FRAMEWORK).read_bytes(),
                          info.get('ElectronAsarIntegrity'), info.get('ElectronAsarIntegrity'))
     recorded = info.get('ElectronAsarIntegrity', {}).get('Resources/app.asar', {}).get('hash')
@@ -252,6 +253,7 @@ def verify_build(app, *, home=None, official=Path('/Applications/ChatGPT.app'), 
     selected_voice, voices = verify_voice_settings(worker_path.parent, source_root / 'runtime/assets.json')
     return {'app': str(app), 'version': VERSION, 'packedAssetsVerified': count,
             'signaturesVerified': True, 'embeddedAsarIntegrityVerified': True,
+            'signingIdentity': signing,
             'permanentProfilePreserved': True, 'voicePickerHooksVerified': True,
             'selectionHighlightHooksVerified': True, 'codeBlockSkippingVerified': True,
             'speechHostAdapter': speech_host,

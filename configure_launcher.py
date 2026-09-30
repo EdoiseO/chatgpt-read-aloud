@@ -10,6 +10,8 @@ import stat
 import subprocess
 import tempfile
 
+from signing_identity import record_signing_identity, resolve_signing_identity, sign_bundle
+
 ROOT = Path(__file__).resolve().parent
 APP = ROOT / 'build/ChatGPT Read Aloud.app'
 PROFILE = Path.home() / 'Library/Application Support/ChatGPT Read Aloud/user-data'
@@ -42,7 +44,7 @@ def validate_stage_target(app, *, home=None, official=Path('/Applications/ChatGP
     return app
 
 
-def main(app=APP, profile=PROFILE, register=False, refresh_launcher=False):
+def main(app=APP, profile=PROFILE, register=False, refresh_launcher=False, signing_identity=None):
     app = validate_stage_target(app)
     profile = Path(profile).expanduser().absolute()
     if register:
@@ -68,7 +70,7 @@ def main(app=APP, profile=PROFILE, register=False, refresh_launcher=False):
     processes = subprocess.run(['ps', '-axo', 'args='], check=True, capture_output=True, text=True).stdout.splitlines()
     if any(row.strip().startswith(str(app / 'Contents/MacOS') + '/') for row in processes):
         raise RuntimeError('Quit the experimental app before configuring its launcher')
-    subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+    signing_identity = resolve_signing_identity(signing_identity, info=info, app=app, runner=subprocess.run)
     # Work on an independent bundle. Compiler/signature failures leave the input
     # stage byte-for-byte intact rather than partly renaming its native entry.
     with tempfile.TemporaryDirectory(prefix='.read-aloud-launcher-', dir=app.parent) as temporary:
@@ -89,15 +91,10 @@ def main(app=APP, profile=PROFILE, register=False, refresh_launcher=False):
         info['CodexReadAloudLauncherVersion'] = 3
         # Marker accompanies the native Sparkle gate and preference overrides.
         info['CodexReadAloudUpdaterPolicyVersion'] = 2
+        record_signing_identity(info, signing_identity)
         (working / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
         entitlements = str(ROOT / 'local-entitlements.plist')
-        subprocess.run(['codesign', '--force', '--sign', '-', '--options', 'runtime',
-                        '--entitlements', entitlements, str(working_native)], check=True)
-        subprocess.run(['codesign', '--force', '--sign', '-', '--options', 'runtime',
-                        '--entitlements', entitlements, str(working_main)], check=True)
-        subprocess.run(['codesign', '--force', '--deep', '--sign', '-', '--preserve-metadata=flags',
-                        '--entitlements', entitlements, str(working)], check=True)
-        subprocess.run(['codesign', '--verify', '--deep', '--strict', str(working)], check=True)
+        signing = sign_bundle(working, entitlements, signing_identity, runner=subprocess.run)
         previous = Path(temporary) / 'unconfigured-original.app'
         try:
             app.rename(previous)
@@ -107,6 +104,7 @@ def main(app=APP, profile=PROFILE, register=False, refresh_launcher=False):
                 previous.rename(app)
             raise
     print('Native app launcher now supplies the permanent profile before Chromium starts.')
+    print('Signing identity: ' + json.dumps(signing, sort_keys=True))
 
 
 if __name__ == '__main__':
@@ -115,8 +113,10 @@ if __name__ == '__main__':
     parser.add_argument('--profile', type=Path, default=PROFILE)
     parser.add_argument('--no-register', action='store_true', help='Compatibility flag; stages are never registered')
     parser.add_argument('--refresh-launcher', action='store_true', help='Recompile the wrapper of an already configured scratch stage')
+    parser.add_argument('--signing-identity', help='Exact certificate SHA-1 fingerprint; otherwise inherit the signed stage pin')
     args = parser.parse_args()
     try:
-        main(args.app, args.profile, register=False, refresh_launcher=args.refresh_launcher)
+        main(args.app, args.profile, register=False, refresh_launcher=args.refresh_launcher,
+             signing_identity=args.signing_identity)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
         raise SystemExit(str(error)) from None

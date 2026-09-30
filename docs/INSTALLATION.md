@@ -187,12 +187,43 @@ Restarting an unchanged build should not by itself change that identity. The
 official ChatGPT app has its own separate identity and permission entries.
 
 Keeping permissions across rebuilt versions requires a persistent code-signing
-identity and compatible designated requirements. This is not configured by the
-current installer. Do not reset privacy records or weaken signing requirements
-to hide repeated prompts. See [Apple's code-signing requirements guide](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+identity and compatible designated requirements. The builder supports an
+existing certificate and private key; it does not create or import credentials.
+Do not reset privacy records or weaken signing requirements to hide repeated
+prompts. See [Apple's code-signing requirements guide](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
 
 **App Management** allows an app to update or delete other apps; playing speech
 does not require that permission. App installation may need it separately.
+
+### Optional persistent signing
+
+Use an appropriate code-signing identity already available in your keychain.
+An Apple-issued development or Developer ID certificate is preferable. Certificate
+creation, keychain import, and trust changes require separate setup; the build
+commands below perform none of those actions.
+
+List valid identities, then pass the exact 40-digit certificate fingerprint
+(not its display name) when preparing a scratch stage:
+
+```sh
+security find-identity -v -p codesigning
+python3 build_copy.py --refresh-copy --target "build/ChatGPT Read Aloud.app" \
+  --signing-identity CERTIFICATE_SHA1
+```
+
+Replace `CERTIFICATE_SHA1` with the selected fingerprint. The build records it
+inside the signed bundle. Subsequent refreshes and launcher configuration inherit
+that pin, and fail if the identity is unavailable or a different identity is
+requested. The native helper also gets a stable signing identifier. Verification
+reports the actual app and helper requirements; activation checks that a pinned
+update satisfies its predecessor's requirements in both directions. Automatic
+certificate rotation and a return to ad-hoc signing are intentionally unsupported.
+
+Moving an existing ad-hoc installation to this certificate changes its identity
+once and may require fresh permission approvals. Compatible requirements address
+identity tracking; they do not prove that every macOS privacy category will retain
+its grant. Verify two successive signed builds and the actual permissions before
+claiming that behavior has been fixed.
 
 ### Prepare and activate an update
 

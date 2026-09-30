@@ -20,6 +20,8 @@ import configure_launcher as launcher
 import verify_voice_build as verify
 import update_menu_adapter as update_menu
 import speech_host_adapter as speech_host
+from test_signing_identity import signature_output, fake_runner, PIN, OTHER_PIN
+import signing_identity
 from updater_host_gate import HOST_GATE_ASSETS, HOST_GATE_ANCHORS
 
 
@@ -89,7 +91,7 @@ def fixture():
         host_hash = hashlib.sha256(host.encode()).hexdigest()
         with patch.object(speech_host, 'TOOLBAR_SHA256', host_hash):
             asset = speech_host.append_payload(speech_host.patch_toolbar(host), payload)
-        timeline = '\n'.join(before for _label, before, _after in speech_host.VOICE_TIMELINE_PATCHES)
+        timeline = '\n'.join(before for _label, before, _after in speech_host.VOICE_TIMELINE_PATCHES) + '\nexport{}'
         timeline_hash = hashlib.sha256(timeline.encode()).hexdigest()
         with patch.object(speech_host, 'VOICE_TIMELINE_SHA256', timeline_hash):
             patched_timeline = speech_host.patch_voice_timeline(timeline)
@@ -132,7 +134,9 @@ def fixture():
         commands = []
         def runner(arguments, **kwargs):
             commands.append(list(arguments))
-            return SimpleNamespace(returncode=0, stdout='0\n' if arguments[0] == '/usr/bin/defaults' else '', stderr='')
+            output = signature_output(arguments[-1]) if '--display' in arguments else (
+                '0\n' if arguments[0] == '/usr/bin/defaults' else '')
+            return SimpleNamespace(returncode=0, stdout=output, stderr='')
         with patch.dict(HOST_GATE_ASSETS, {key: hashlib.sha256(value).hexdigest()
                                           for key, value in gate_files.items()}, clear=True), \
                 patch.object(speech_host, 'TOOLBAR_SHA256', host_hash), \
@@ -168,7 +172,11 @@ class VerifierTests(unittest.TestCase):
             self.assertTrue(report['speechHostAdapter']['speechControlsAlwaysVisible'])
             self.assertEqual(check(data, scope='installed')['activation'], 'installed')
             self.assertEqual((data.runtime / 'settings.json').read_bytes(), settings)
-            self.assertEqual(len(data.commands), 6)
+            self.assertEqual(report['signingIdentity']['mode'], 'adhoc')
+            self.assertIn('designatedRequirement', report['signingIdentity']['native'])
+            self.assertEqual(len([args for args in data.commands if '--verify' in args]), 4)
+            self.assertEqual(len([args for args in data.commands if '--display' in args]), 4)
+            self.assertFalse(any('--sign' in args for args in data.commands))
 
     def test_installed_effective_preferences_cannot_hide_behind_stale_disk_values(self):
         with fixture() as data:
@@ -240,7 +248,7 @@ class VerifierTests(unittest.TestCase):
             data.framework.write_bytes(data.framework.read_bytes()[:-1] + b'X')
             with self.assertRaisesRegex(ValueError, 'digest disagree'):
                 check(data)
-            self.assertEqual(len(data.commands), 2)
+            self.assertEqual(len([args for args in data.commands if '--verify' in args]), 2)
         with fixture() as data:
             with self.assertRaises(subprocess.CalledProcessError):
                 verify.verify_build(data.app, home=data.home, source_root=data.source,
@@ -250,8 +258,9 @@ class VerifierTests(unittest.TestCase):
         code = ('from pathlib import Path; import sys,json; import verify_voice_build as v; '
                 'import updater_host_gate as g; g.HOST_GATE_ASSETS.update(json.loads(sys.argv[4])); '
                 'import speech_host_adapter as s; s.TOOLBAR_SHA256=sys.argv[5]; s.VOICE_TIMELINE_SHA256=sys.argv[7]; '
+                'from test_signing_identity import fake_runner; '
                 'v.verify_build(Path(sys.argv[1]),home=Path(sys.argv[2]),source_root=Path(sys.argv[3]),'
-                'runner=lambda *a,**k:None)')
+                'runner=fake_runner())')
         code = code.replace('v.verify_build(', 'import update_menu_adapter as m; m.HOST_MENU_SHA256=sys.argv[6]; v.verify_build(')
         for mutation in ('valid', 'identity', 'marker', 'speech_marker', 'update_marker', 'stale_checker', 'header', 'truncated', 'block_size', 'stale_worker', 'voice'):
             with self.subTest(mutation=mutation), fixture() as data:
@@ -300,6 +309,36 @@ class VerifierTests(unittest.TestCase):
 
 
 class LauncherStageTests(unittest.TestCase):
+    def test_pinned_launcher_refresh_inherits_one_identity_for_all_signing_passes(self):
+        with fixture() as data:
+            signing_identity.record_signing_identity(data.info, PIN)
+            data.info_path.write_bytes(plistlib.dumps(data.info))
+            commands = []
+            signed_runner = fake_runner(PIN, commands=commands)
+            def runner(arguments, **kwargs):
+                if arguments[0] == 'xcrun':
+                    Path(arguments[-1]).write_bytes(b'updated wrapper')
+                return signed_runner(arguments, **kwargs)
+            with patch.object(launcher.subprocess, 'run', side_effect=runner), patch('builtins.print'):
+                launcher.main(data.app, profile=data.runtime.parent / 'user-data', refresh_launcher=True)
+            signed = [args for args in commands if '--sign' in args]
+            self.assertEqual(len(signed), 3)
+            self.assertTrue(all(args[args.index('--sign') + 1] == PIN for args in signed))
+            self.assertEqual(signing_identity.signing_pin(plistlib.loads(data.info_path.read_bytes())), PIN)
+
+    def test_launcher_identity_mismatch_fails_before_compiling_or_changing_stage(self):
+        with fixture() as data:
+            signing_identity.record_signing_identity(data.info, PIN)
+            data.info_path.write_bytes(plistlib.dumps(data.info))
+            before = {str(path): path.read_bytes() for path in data.app.rglob('*') if path.is_file()}
+            commands = []
+            with patch.object(launcher.subprocess, 'run', side_effect=fake_runner(PIN, commands=commands)):
+                with self.assertRaisesRegex(RuntimeError, 'differs from'):
+                    launcher.main(data.app, profile=data.runtime.parent / 'user-data',
+                                  refresh_launcher=True, signing_identity=OTHER_PIN)
+            self.assertFalse(any(args[0] == 'xcrun' or '--sign' in args for args in commands))
+            self.assertEqual({str(path): path.read_bytes() for path in data.app.rglob('*') if path.is_file()}, before)
+
     def test_installed_targets_rejected_before_commands_or_files_are_read(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()
@@ -335,9 +374,9 @@ class LauncherStageTests(unittest.TestCase):
                         if failure == 'compile':
                             raise subprocess.CalledProcessError(1, arguments)
                         Path(arguments[-1]).write_bytes(b'fixture compiled launcher')
-                    if arguments[0] == 'codesign' and '--force' in arguments and failure == 'sign':
+                    if Path(arguments[0]).name == 'codesign' and '--force' in arguments and failure == 'sign':
                         raise subprocess.CalledProcessError(1, arguments)
-                    return SimpleNamespace(returncode=0, stdout='', stderr='')
+                    return SimpleNamespace(returncode=0, stdout=signature_output(arguments[-1]) if '--display' in arguments else '', stderr='')
                 with patch.object(launcher.subprocess, 'run', side_effect=runner):
                     with self.assertRaises(subprocess.CalledProcessError):
                         launcher.main(data.app, profile=data.runtime.parent / 'user-data')
@@ -355,7 +394,7 @@ class LauncherStageTests(unittest.TestCase):
                 commands.append(arguments)
                 if arguments[0] == 'xcrun':
                     Path(arguments[-1]).write_bytes(b'updated wrapper')
-                return SimpleNamespace(returncode=0, stdout='', stderr='')
+                return SimpleNamespace(returncode=0, stdout=signature_output(arguments[-1]) if '--display' in arguments else '', stderr='')
             with patch.object(launcher.subprocess, 'run', side_effect=runner), patch('builtins.print'):
                 launcher.main(data.app, profile=profile, refresh_launcher=True)
             self.assertEqual((data.app / 'Contents/MacOS/ChatGPT-native').read_bytes(), native)

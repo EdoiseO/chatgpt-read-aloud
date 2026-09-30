@@ -77,9 +77,21 @@ function sentenceSpans(text, locale) {
   return spans;
 }
 
-export function buildResponseTextMap(root, { range = null } = {}) {
+export function buildResponseTextMap(root, { range = null, textRoots = null } = {}) {
   const document = root?.ownerDocument;
   const view = document?.defaultView;
+  // A voice reply may contain transcript, research, and non-speech work cards.
+  // Explicit roots restrict speech to reviewed assistant content. Invalid or
+  // empty roots fail closed; they must never fall back to the entire wrapper.
+  let allowed = null;
+  if (textRoots !== null) {
+    try {
+      allowed = Array.from(textRoots);
+      if (!allowed.every(part => part?.nodeType === 1 && within(root, part))) allowed = [];
+    } catch { allowed = []; }
+  }
+  const ownedText = node => allowed === null || allowed.some(part => within(part, node));
+  const traversable = node => allowed === null || allowed.some(part => within(part, node) || within(node, part));
   const units = [];
   const snapshots = new Map();
   let pendingSpace = null;
@@ -101,6 +113,7 @@ export function buildResponseTextMap(root, { range = null } = {}) {
     pendingBreaks = 0;
   }
   function text(node, preserve) {
+    if (!ownedText(node)) return;
     const raw = node.data ?? node.textContent ?? '';
     let first = 0, last = raw.length;
     if (range) {
@@ -131,7 +144,7 @@ export function buildResponseTextMap(root, { range = null } = {}) {
   }
   function walk(node, preserve = false) {
     if (node.nodeType === 3) { text(node, preserve); return; }
-    if (node.nodeType !== 1 || !visibleElement(node, view)) return;
+    if (node.nodeType !== 1 || !traversable(node) || !visibleElement(node, view)) return;
     if (range) {
       try { if (!range.intersectsNode(node)) return; } catch { return; }
     }
@@ -172,7 +185,8 @@ export function buildResponseTextMap(root, { range = null } = {}) {
   function valid(start, end) {
     return Number.isInteger(start) && Number.isInteger(end) && start >= 0 && end > start && end <= content.length &&
       !!root?.isConnected && cleanUnits.slice(start, end).every(unit => !unit.node ||
-        within(root, unit.node) && (unit.node.data ?? unit.node.textContent) === snapshots.get(unit.node));
+        within(root, unit.node) && ownedText(unit.node) &&
+        (unit.node.data ?? unit.node.textContent) === snapshots.get(unit.node));
   }
   function rangesForOffsets(start, end) {
     if (!valid(start, end)) return [];
@@ -205,16 +219,35 @@ export function buildResponseTextMap(root, { range = null } = {}) {
     if (result.toString().replace(/\s/gu, '') !== content.slice(start, end).replace(/\s/gu, '')) return null;
     return result;
   }
+  function isCurrent() {
+    if (!content.length || !valid(0, content.length)) return false;
+    // Exclusions, insertions, and DOM order can change without changing an old
+    // text node. Rebuild eligibility before a queued grouped read is dispatched.
+    const fresh = buildResponseTextMap(root, { range, textRoots: allowed });
+    if (fresh.text !== content) return false;
+    const before = rangesForOffsets(0, content.length);
+    const after = fresh.rangesForOffsets(0, content.length);
+    return before.length === after.length && before.every((piece, index) =>
+      piece.startContainer === after[index].startContainer && piece.startOffset === after[index].startOffset &&
+      piece.endContainer === after[index].endContainer && piece.endOffset === after[index].endOffset);
+  }
   return Object.freeze({ root, text: content, rangeForOffsets, rangesForOffsets,
+    isCurrent,
     sentenceSpans: locale => sentenceSpans(content, locale) });
 }
 
-export function captureResponseSelection(root, selection = root?.ownerDocument?.defaultView?.getSelection?.()) {
+export function captureResponseSelection(root, selection = root?.ownerDocument?.defaultView?.getSelection?.(), { textRoots = null } = {}) {
   try {
     if (!selection || selection.rangeCount !== 1 || selection.isCollapsed) return null;
     const range = selection.getRangeAt(0).cloneRange();
     if (range.collapsed || !within(root, range.startContainer) || !within(root, range.endContainer)) return null;
-    const map = buildResponseTextMap(root, { range });
+    if (textRoots !== null) {
+      const parts = Array.from(textRoots);
+      if (!parts.length || !parts.every(part => part?.nodeType === 1 && within(root, part)) ||
+          !parts.some(part => within(part, range.startContainer)) ||
+          !parts.some(part => within(part, range.endContainer))) return null;
+    }
+    const map = buildResponseTextMap(root, { range, textRoots });
     return map.text ? Object.freeze({ text: map.text, range, map }) : null;
   } catch { return null; }
 }
