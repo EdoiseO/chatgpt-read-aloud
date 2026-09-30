@@ -1,8 +1,8 @@
 # Install ChatGPT Read Aloud
 
-This project adds a speaker button to completed Codex responses in a separate
-local copy of the ChatGPT desktop app. It can read a whole response or a selected
-passage, with a soft yellow highlight following the sentence whose audio is
+This local read-aloud add-on adds a speaker button to completed Codex responses
+through a separate patched copy of ChatGPT for Mac. It can read a whole response
+or a selected passage, with a soft yellow highlight following the sentence whose audio is
 playing. The goal is reading support and focus. The project makes no medical
 claims.
 
@@ -12,6 +12,9 @@ verification reports stay on your Mac.
 
 For an agent-assisted installation, use the copy/paste prompt in
 [INSTALL_WITH_CODEX.md](INSTALL_WITH_CODEX.md).
+
+See [development notes](DEVELOPMENT.md) for model details, tests, and current
+code-reading limitations.
 
 ## Requirements
 

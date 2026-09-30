@@ -12,9 +12,10 @@ current patch requires the official desktop app at **26.928.20755**.
 Help me install the source-only project at:
 https://github.com/EdoiseO/chatgpt-read-aloud
 
-I want a speaker button for each completed Codex response in a separate local
-ChatGPT Read Aloud desktop app. With no text selected, it should read that one
-response. With a passage selected in that response, its speaker or the floating
+I want the local read-aloud add-on for completed Codex responses in ChatGPT for
+Mac, installed through a separate patched copy called ChatGPT Read Aloud.
+With no text selected, it should read that one response. With a passage selected
+in that response, its speaker or the floating
 Read aloud action should read only the passage. A soft yellow highlight should
 follow the sentence whose audio is actually playing, preserving normal blue
 selection and response formatting. I want the local Kokoro 82M MLX float32
@@ -22,7 +23,7 @@ runtime and a saved voice that I choose in the picker. Aoede (af_aoede) is an
 example to audition, not a forced initial choice. The purpose is reading support
 and focus; do not make medical claims.
 
-Read the repository README, docs/INSTALLATION.md, and relevant scripts before
+Read the repository README, docs/INSTALLATION.md, docs/DEVELOPMENT.md, and relevant scripts before
 running them. Inspect --help and use the actual current CLI contracts. Obtain a
 clean source checkout if needed; do not upload or commit local outputs.
 
