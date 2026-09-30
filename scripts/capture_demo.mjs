@@ -8,7 +8,8 @@ import { chromium } from 'playwright';
 import './prepare_demo.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const out = path.join(root, 'output/playwright');
-const images = path.join(root, 'docs/images');
+// Keep synthetic demonstrations separate from user-supplied app screenshots.
+const images = path.join(root, 'docs/images/demos');
 mkdirSync(images, { recursive: true });
 const browser = await chromium.launch({ headless: true });
 try {

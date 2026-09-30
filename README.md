@@ -20,8 +20,9 @@ generation still uses OpenAI.
 
 ![Read aloud on a selected passage](docs/images/read-selection.png)
 
-*Sample-text demo with simulated playback.
-[More screenshots](docs/SCREENSHOTS.md).*
+**Read selected text.** Highlight a passage and choose **Read aloud**.
+
+[See the screenshots](docs/SCREENSHOTS.md).
 
 ## Install
 

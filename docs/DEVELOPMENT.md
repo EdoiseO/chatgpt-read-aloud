@@ -88,3 +88,19 @@ See [screenshot provenance and reproduction](SCREENSHOTS.md) and
 [third-party dependencies](../THIRD_PARTY.md). Contributions that support a newer
 app version should include reviewed anchors, integrity verification, and the
 relevant selection/playback tests.
+
+## Documentation demos
+
+The screenshot gallery uses real app captures supplied by the project user.
+The original synthetic feature demos remain available separately. To regenerate
+them with the existing development dependencies:
+
+```sh
+npm run demo:capture
+```
+
+The script runs a fresh offline browser and writes synthetic images to
+`docs/images/demos/`, with intermediate pages in ignored `output/playwright/`.
+It does not overwrite the real app screenshots or connect to the installed app.
+The voice-picker demo uses sample metadata with Aoede selected; it generates no
+speech and does not save a voice setting.
