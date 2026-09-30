@@ -1,0 +1,23 @@
+name: Source and fixture tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: npm ci
+      - run: npx playwright install chromium
+      - run: npm test
+      - run: python3 -m unittest discover -p 'test_*.py'
+      - run: python3 test-kokoro-worker-sentences.py
