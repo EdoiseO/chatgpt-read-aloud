@@ -13,6 +13,7 @@ const MAX_REQUEST_ID_LENGTH = 128;
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_PENDING_RPC = 16;
 const MAX_SENTENCE_RANGES = 4096;
+const WORKER_PROTOCOL_VERSION = 2;
 
 function validSentenceRanges(text, ranges) {
   if (typeof text !== 'string' || !Array.isArray(ranges) ||
@@ -175,6 +176,21 @@ function createKokoroMainBridge({
     idleTimer = timer(() => endSession(session, 'Local read-aloud worker became idle.'), idleTimeoutMs);
   }
 
+  function sentenceProgress(requestOwner, result, skipped) {
+    if (!requestOwner?.sentenceRanges) {
+      return !skipped && result.sentenceStart === undefined && result.sentenceEnd === undefined;
+    }
+    const start = result.sentenceStart, end = result.sentenceEnd;
+    const index = Number.isSafeInteger(start) && Number.isSafeInteger(end)
+      ? requestOwner.sentenceRanges.findIndex(range => range.start === start && range.end === end) : -1;
+    const previous = requestOwner.lastSentenceIndex;
+    if (index < 0 || index < previous || index > previous + 1 ||
+      (index === previous && (skipped || requestOwner.lastSentenceSkipped))) return false;
+    requestOwner.lastSentenceIndex = index;
+    requestOwner.lastSentenceSkipped = skipped;
+    return true;
+  }
+
   function parseResponse(session, line) {
     if (childSession !== session) return;
     let response;
@@ -182,7 +198,26 @@ function createKokoroMainBridge({
       endSession(session, 'Local read-aloud worker sent an invalid response.');
       return;
     }
-    if (response?.event === 'ready' && response.rpcId === undefined) return;
+    if (response?.event === 'fatal') {
+      const startupFailure = !session.ready && Object.keys(response).length === 2 &&
+        response.error && typeof response.error === 'object' && !Array.isArray(response.error) &&
+        Object.keys(response.error).length === 1 && response.error.code === 'RUNTIME_UNAVAILABLE';
+      endSession(session, startupFailure ? 'Unable to start local read-aloud worker.'
+        : 'Local read-aloud worker sent an invalid response.');
+      return;
+    }
+    if (response?.event === 'ready' && response.rpcId === undefined) {
+      if (session.ready || response.protocolVersion !== WORKER_PROTOCOL_VERSION || !['mlx', 'onnx'].includes(response.engine)) {
+        endSession(session, 'Local read-aloud worker sent an invalid response.');
+        return;
+      }
+      session.ready = true;
+      return;
+    }
+    if (!session.ready) {
+      endSession(session, 'Local read-aloud worker sent an invalid response.');
+      return;
+    }
     if (!Number.isSafeInteger(response?.rpcId) || response.rpcId < 1) {
       endSession(session, 'Local read-aloud worker sent an invalid response.');
       return;
@@ -197,11 +232,24 @@ function createKokoroMainBridge({
       if (owner === entry.owner) { clearOwner(); sendCancel(session, entry.requestId); }
       return;
     }
-    if (response.error) {
+    if (Object.hasOwn(response, 'error')) {
+      const error = response.error;
+      const validError = error && typeof error === 'object' && !Array.isArray(error) &&
+        Object.keys(response).every(key => ['rpcId', 'error'].includes(key)) &&
+        Object.keys(error).every(key => ['code', 'message'].includes(key)) &&
+        (error.message === undefined || typeof error.message === 'string') &&
+        ['BUSY', 'CANCELED', 'INVALID_ACTION', 'INVALID_REQUEST', 'INVALID_SENTENCE_RANGES',
+          'INVALID_TEXT', 'INVALID_VOICE', 'SPEECH_FAILED', 'VOICE_NOT_SELECTED'].includes(error.code);
+      if (!validError) {
+        entry.reject(new Error('Local read-aloud worker sent an invalid response.'));
+        endSession(session, 'Local read-aloud worker sent an invalid response.');
+        return;
+      }
       // This fixed code lets the renderer open its voice picker without
       // forwarding arbitrary worker diagnostics to the desktop UI.
-      const message = response.error.code === 'VOICE_NOT_SELECTED'
-        ? 'VOICE_NOT_SELECTED' : 'Unable to generate local read-aloud audio.';
+      const message = error.code === 'VOICE_NOT_SELECTED' ? 'VOICE_NOT_SELECTED'
+        : error.code === 'SPEECH_FAILED' ? 'Unable to generate local read-aloud audio.'
+          : 'Local read-aloud worker rejected the request.';
       entry.reject(new Error(message));
       if (owner === entry.owner) clearOwner();
       return;
@@ -209,24 +257,23 @@ function createKokoroMainBridge({
     const result = response.result;
     let sanitized;
     if (entry.action === 'voices' || entry.action === 'set_voice') sanitized = voiceMetadata(result, entry.action);
-    else if (result?.done === true) sanitized = { done: true };
-    else if (result?.done === false && result.mimeType === 'audio/wav' &&
+    else if (result?.done === true && result.skipped === undefined && result.audioBase64 === undefined &&
+      result.mimeType === undefined && result.sentenceStart === undefined && result.sentenceEnd === undefined) {
+      if (!entry.owner?.sentenceRanges || entry.owner.lastSentenceIndex === entry.owner.sentenceRanges.length - 1) sanitized = { done: true };
+    } else if (result?.done === false && result.skipped === true && result.audioBase64 === undefined &&
+      result.mimeType === undefined && sentenceProgress(entry.owner, result, true)) {
+      sanitized = { done: false, skipped: true, sentenceStart: result.sentenceStart, sentenceEnd: result.sentenceEnd };
+    }
+    else if (result?.done === false && result.skipped === undefined && result.mimeType === 'audio/wav' &&
       typeof result.audioBase64 === 'string' && result.audioBase64.length > 0 &&
       result.audioBase64.length <= MAX_RESPONSE_BYTES && result.audioBase64.length % 4 === 0 &&
       /^[A-Za-z0-9+/]*={0,2}$/.test(result.audioBase64)) {
       sanitized = { done: false, audioBase64: result.audioBase64, mimeType: 'audio/wav' };
-      if (entry.owner?.sentenceRanges) {
-        const start = result.sentenceStart;
-        const end = result.sentenceEnd;
-        const index = Number.isSafeInteger(start) && Number.isSafeInteger(end)
-          ? entry.owner.sentenceRanges.findIndex(range => range.start === start && range.end === end) : -1;
-        if (index < 0 || index < entry.owner.lastSentenceIndex) sanitized = null;
-        else {
-          entry.owner.lastSentenceIndex = index;
-          sanitized.sentenceStart = start;
-          sanitized.sentenceEnd = end;
-        }
-      } else if (result.sentenceStart !== undefined || result.sentenceEnd !== undefined) sanitized = null;
+      if (!sentenceProgress(entry.owner, result, false)) sanitized = null;
+      else if (entry.owner?.sentenceRanges) {
+        sanitized.sentenceStart = result.sentenceStart;
+        sanitized.sentenceEnd = result.sentenceEnd;
+      }
     }
     if (!sanitized) {
       entry.reject(new Error('Local read-aloud worker sent an invalid response.'));
@@ -245,7 +292,7 @@ function createKokoroMainBridge({
     try {
       child = spawn('/usr/bin/sandbox-exec', [
         '-p', SANDBOX_PROFILE,
-        path.join(runtime, '.venv/bin/python'), '-u', path.join(runtime, 'worker-sentences-v1.py'),
+        path.join(runtime, '.venv/bin/python'), '-u', path.join(runtime, 'worker-sentences-v2.py'),
       ], {
         cwd: runtime,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -255,7 +302,7 @@ function createKokoroMainBridge({
     } catch {
       throw new Error('Unable to start local read-aloud worker.');
     }
-    const session = { child, buffer: '', decoder: new StringDecoder('utf8') };
+    const session = { child, ready: false, buffer: '', decoder: new StringDecoder('utf8') };
     childSession = session;
     child.once('error', () => endSession(session, 'Unable to start local read-aloud worker.'));
     child.once('exit', () => endSession(session, 'Local read-aloud worker stopped.', false));
@@ -366,6 +413,7 @@ function createKokoroMainBridge({
     if (payload.sentenceRanges !== undefined) {
       requestOwner.sentenceRanges = payload.sentenceRanges.map(({ start, end }) => ({ start, end }));
       requestOwner.lastSentenceIndex = -1;
+      requestOwner.lastSentenceSkipped = false;
     }
     owner = requestOwner;
     requestOwner.onDestroyed = () => {

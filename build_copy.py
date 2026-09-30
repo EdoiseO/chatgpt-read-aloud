@@ -127,6 +127,8 @@ def main():
     args = parser.parse_args()
     if args.target:
         TARGET = args.target.expanduser().absolute()
+    from configure_launcher import validate_stage_target
+    TARGET = validate_stage_target(TARGET)
     target_root, official_root = TARGET.resolve(), SOURCE.resolve()
     if TARGET.is_symlink() or target_root.is_relative_to(official_root) or official_root.is_relative_to(target_root):
         raise SystemExit('Refusing a symlink or a target that overlaps the official app')
@@ -251,6 +253,8 @@ def main():
     info.pop('CFBundleURLTypes', None)
     info['SUEnableAutomaticChecks'] = False
     info['SUAutomaticallyUpdate'] = False
+    info['SUAllowsAutomaticUpdates'] = False
+    info['CodexReadAloudUpdaterPolicyVersion'] = 1
     (TARGET / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
     # Keep Electron's embedded dictionary digest consistent with the changed
     # archive header hash. ASAR validation remains enabled in the copied app.

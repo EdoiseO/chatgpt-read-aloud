@@ -128,6 +128,117 @@ const read = tree => find(tree, node => node.props?.['data-codex-local-read-alou
 const settings = tree => find(tree, node => node.props?.['data-codex-local-read-aloud'] === 'voice');
 const picker = tree => find(tree, node => typeof node.type === 'function' && node.type.name === 'CodexReadAloudVoicePicker');
 const button = (tree, text) => find(tree, node => node.type === 'button' && node.props.children === text);
+function hasNativeOffer(tree) {
+  let found = false;
+  walk(tree, node => { if (node.props?.['data-codex-local-read-aloud'] === 'native-status') found = true; });
+  return found;
+}
+
+test('helper lookup failure offers Mac speech only after explicit choice, preserves the read and never saves a voice', async () => {
+  const f = fixture(), response = f.response('Only the held passage.');
+  const pending = read(response.render()).props.onClick(event());
+  f.jobs[0].reject(new Error("Error invoking remote method 'codex-local-read-aloud': Error: Local read-aloud worker stopped."));
+  await pending;
+  const tree = response.render();
+  assert.equal(find(tree, node => node.props.role === 'alert').props.children[0].props.children,
+    'Local speech is unavailable.');
+  assert.equal(f.toggles.length, 0, 'lookup failure must not start speech automatically');
+  assert.equal(read(tree).props['aria-label'], 'Stop reading aloud');
+  button(tree, 'Use Mac voice').props.onClick(event());
+  assert.equal(f.toggles.length, 1);
+  assert.equal(f.toggles[0].text, 'Only the held passage.');
+  assert.equal(f.toggles[0].options.mode, 'native');
+  assert.equal(f.toggles[0].options.voice, undefined);
+  assert.equal(f.jobs.length, 1); assert.equal(f.saves.length, 0); assert.equal(f.alerts.length, 0);
+  assert.equal(hasNativeOffer(response.render()), false);
+  await read(response.render()).props.onClick(event());
+  assert.equal(f.jobs.length, 1, 'stopping native speech must not query voice settings');
+  response.unmount();
+});
+
+test('dismiss and stop clear an offer; stale actions cannot choose or dismiss a later offer', async () => {
+  const f = fixture(), response = f.response('Held response.');
+  let pending = read(response.render()).props.onClick(event());
+  f.jobs[0].reject(new Error('Local read-aloud worker timed out.')); await pending;
+  const oldTree = response.render(), staleUse = button(oldTree, 'Use Mac voice'), staleDismiss = button(oldTree, 'Dismiss');
+  staleDismiss.props.onClick(event());
+  assert.equal(hasNativeOffer(response.render()), false);
+  staleUse.props.onClick(event()); assert.equal(f.toggles.length, 0);
+  pending = read(response.render()).props.onClick(event());
+  f.jobs[1].reject(new Error('Unable to start local read-aloud worker.')); await pending;
+  staleUse.props.onClick(event()); staleDismiss.props.onClick(event());
+  assert.equal(hasNativeOffer(response.render()), true, 'old dismissal cannot remove a newer held read');
+  assert.equal(f.toggles.length, 0);
+  await read(response.render()).props.onClick(event());
+  assert.equal(hasNativeOffer(response.render()), false);
+  assert.equal(f.jobs.length, 2); assert.equal(f.saves.length, 0); assert.equal(f.alerts.length, 0);
+  response.unmount();
+});
+
+test('switching or unmounting suppresses late lookup failure and stale native actions', async () => {
+  const f = fixture(), a = f.response('A'), b = f.response('B');
+  const pendingA = read(a.render()).props.onClick(event());
+  const pendingB = read(b.render()).props.onClick(event());
+  f.jobs[0].reject(new Error('Local read-aloud worker stopped.')); await pendingA;
+  assert.equal(hasNativeOffer(a.render()), false); assert.equal(f.alerts.length, 0);
+  f.jobs[1].reject(new Error('Local read-aloud worker stopped.')); await pendingB;
+  const staleUse = button(b.render(), 'Use Mac voice'); b.unmount();
+  staleUse.props.onClick(event()); assert.equal(f.toggles.length, 0);
+  const c = f.response('C'), pendingC = read(c.render()).props.onClick(event());
+  c.unmount(); f.jobs[2].reject(new Error('Local read-aloud worker stopped.')); await pendingC;
+  assert.equal(f.toggles.length, 0); assert.equal(f.alerts.length, 0); assert.equal(f.saves.length, 0);
+  a.unmount();
+});
+
+test('invalid voice metadata and protocol/trust failures do not offer or start native speech', async () => {
+  const invalid = [undefined, null, [], {}, { selectedVoice: '' }, { selectedVoice: 'unknown' },
+    { selectedVoice: 'af_missing', voices: [{ id: 'af_aoede' }] },
+    { selectedVoice: null, voices: {} }, { selectedVoice: null, engine: 'native' },
+    { selectedVoice: 'af_aoede', speed: 2 }];
+  for (const value of invalid) {
+    const f = fixture(), response = f.response('Do not start.');
+    const pending = read(response.render()).props.onClick(event());
+    f.jobs[0].resolve(value); await pending;
+    assert.equal(hasNativeOffer(response.render()), false);
+    assert.equal(f.toggles.length, 0); assert.equal(f.saves.length, 0);
+    assert.deepEqual(f.alerts, ['Could not load local voices. Please try again.']); response.unmount();
+  }
+  for (const message of ['Local read-aloud worker sent an invalid response.',
+    'Read-aloud request is not allowed from this frame.', 'Invalid read-aloud request.', '/private/arbitrary/error']) {
+    const f = fixture(), response = f.response('Do not start.');
+    const pending = read(response.render()).props.onClick(event()); f.jobs[0].reject(new Error(message)); await pending;
+    assert.equal(hasNativeOffer(response.render()), false); assert.equal(f.toggles.length, 0);
+    assert.deepEqual(f.alerts, ['Could not load local voices. Please try again.']); response.unmount();
+  }
+});
+
+test('missing lookup bridge offers explicit native speech and opening the picker discards a held offer', async () => {
+  const f = fixture(), response = f.response('Held response.'); f.bridge.getVoices = undefined;
+  await read(response.render()).props.onClick(event());
+  assert.equal(hasNativeOffer(response.render()), true); assert.equal(f.jobs.length, 0);
+  settings(response.render()).props.onClick(event());
+  assert.equal(hasNativeOffer(response.render()), false);
+  picker(response.render()).props.onChosen({ selectedVoice: 'af_aoede' });
+  assert.equal(f.toggles.length, 0, 'choosing a voice later must not resurrect the failed read');
+  assert.equal(f.saves.length, 0); response.unmount();
+});
+
+test('fixed startup/runtime failure messages offer explicit Mac speech without exposing diagnostics', async () => {
+  for (const message of ['Local read-aloud is unavailable.', 'Unable to start local read-aloud worker.',
+    'Local read-aloud worker timed out.', 'Unable to generate local read-aloud audio.']) {
+    const f = fixture(), response = f.response('Before.\n```js\nskipCode();\n```\nAfter.');
+    const pending = read(response.render()).props.onClick(event());
+    f.jobs[0].reject(new Error(message)); await pending;
+    const tree = response.render();
+    assert.equal(hasNativeOffer(tree), true); assert.equal(f.toggles.length, 0);
+    assert.equal(find(tree, node => node.props.role === 'alert').props.children[0].props.children,
+      'Local speech is unavailable.');
+    button(tree, 'Use Mac voice').props.onClick(event());
+    assert.equal(f.toggles[0].text, 'Before.\n\nAfter.');
+    assert.equal(f.toggles[0].options.mode, 'native');
+    assert.equal(f.saves.length, 0); assert.equal(f.alerts.length, 0); response.unmount();
+  }
+});
 
 test('first response waits for a voice choice; cancel is silent; saving resumes only its response', async () => {
   const f = fixture(), a = f.response('Only response A.');

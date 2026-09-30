@@ -35,6 +35,8 @@ def fixture():
                            'url': 'https://huggingface.co/test/pinned/' + name})
         manifest = root / 'assets.json'
         manifest.write_text(json.dumps({'version': 1, 'engine': 'mlx', 'dtype': 'float32', 'assets': assets}))
+        requirements = root / 'requirements.lock'
+        requirements.write_bytes((setup.ROOT / 'runtime/requirements.lock').read_bytes())
         worker = root / 'worker.py'
         worker.write_bytes(b'# isolated fixture worker, never executed\n')
         commands = []
@@ -51,7 +53,7 @@ def fixture():
                 python.chmod(0o700)
             return SimpleNamespace(returncode=0, stdout=output, stderr='')
         yield SimpleNamespace(root=root, home=home, cache=cache, manifest=manifest, worker=worker,
-                              assets=assets, runner=runner, commands=commands)
+                              assets=assets, runner=runner, commands=commands, requirements=requirements)
 
 
 def create_runtime(data, asset_cache=True, opener=None):
@@ -59,7 +61,7 @@ def create_runtime(data, asset_cache=True, opener=None):
         return setup.setup_runtime(home=data.home, python='/fixture/python3.13',
                     asset_cache=data.cache if asset_cache else None, runner=data.runner,
                     opener=opener or (lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('No network'))),
-                    manifest_path=data.manifest, worker_source=data.worker)
+                    manifest_path=data.manifest, worker_source=data.worker, requirements=data.requirements)
 
 
 def create_bundle(data):
@@ -106,7 +108,8 @@ def run_install(data, config, **overrides):
         assert (app / 'Contents/MacOS/ChatGPT-native').is_file()
     options = dict(runner=data.runner, configure=configure_fixture, verify=verify,
                    runtime_verify=lambda home: install.verify_completed_runtime(home, data.manifest, data.worker),
-                   publish=publish_fixture)
+                   publish=publish_fixture,
+                   migrate_policy=lambda *_args, **_kwargs: {'customPreferencesMigrated': True})
     options.update(overrides)
     with patch.object(install, 'require_platform'):
         return install.install_fresh(config, **options)
@@ -119,7 +122,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(runtime.stat().st_mode & 0o777, 0o700)
             self.assertEqual(json.loads((runtime / 'settings.json').read_text())['selectedVoice'], None)
             self.assertEqual(json.loads((runtime / 'engine.json').read_text()), {'engine': 'mlx', 'dtype': 'float32'})
-            self.assertEqual((runtime / 'worker-sentences-v1.py').read_bytes(), data.worker.read_bytes())
+            self.assertEqual((runtime / 'worker-sentences-v2.py').read_bytes(), data.worker.read_bytes())
             for asset in data.assets:
                 target = runtime / asset['path']
                 self.assertEqual(target.read_bytes(), (data.cache / asset['cacheName']).read_bytes())
@@ -129,6 +132,21 @@ class BootstrapTests(unittest.TestCase):
                 self.assertIn(flag, pip)
             self.assertEqual(pip[0], str(runtime / '.venv/bin/python'))
             self.assertEqual(install.verify_completed_runtime(data.home, data.manifest, data.worker), runtime)
+
+    def test_fresh_setup_installs_from_an_immutable_private_requirements_snapshot(self):
+        with fixture() as data:
+            original = data.requirements.read_bytes()
+            runner = data.runner
+            def change_source(arguments, **keywords):
+                if 'pip' in arguments:
+                    data.requirements.write_bytes(b'changed source after reviewed lock snapshot')
+                    self.assertEqual(Path(arguments[-1]).read_bytes(), original)
+                return runner(arguments, **keywords)
+            data.runner = change_source
+            runtime = create_runtime(data)
+            self.assertEqual((runtime / 'requirements.lock').read_bytes(), original)
+            self.assertEqual((runtime / 'requirements.lock').stat().st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads((runtime / 'installation.json').read_text())['requirementsHash'], hashlib.sha256(original).hexdigest())
 
     def test_occupied_runtime_or_symlink_is_never_changed_or_passed_to_commands(self):
         for symlink in (False, True):
@@ -211,7 +229,7 @@ class BootstrapTests(unittest.TestCase):
             runtime = create_runtime(data)
             config = create_bundle(data)
             source_info = (config.app / 'Contents/Info.plist').read_bytes()
-            worker = (runtime / 'worker-sentences-v1.py').read_bytes()
+            worker = (runtime / 'worker-sentences-v2.py').read_bytes()
             result = run_install(data, config)
             self.assertEqual(result['app'], str(config.target))
             self.assertEqual(config.profile.stat().st_mode & 0o777, 0o700)
@@ -221,7 +239,7 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual((config.app / 'Contents/Info.plist').read_bytes(), source_info)
             self.assertFalse((config.app / 'Contents/MacOS/ChatGPT-native').exists())
             self.assertEqual((config.official / 'untouched').read_bytes(), b'official app must remain unchanged')
-            self.assertEqual((runtime / 'worker-sentences-v1.py').read_bytes(), worker)
+            self.assertEqual((runtime / 'worker-sentences-v2.py').read_bytes(), worker)
             commands = [arguments for arguments, _ in data.commands]
             self.assertFalse(any(arguments[0] in ('/usr/bin/open', 'open', 'kill', '/bin/kill') for arguments in commands))
             self.assertTrue(any(arguments[0] == install.REGISTER for arguments in commands))
@@ -355,7 +373,7 @@ class BootstrapTests(unittest.TestCase):
                 if change == 'model':
                     (runtime / data.assets[0]['path']).write_bytes(b'changed pinned model')
                 elif change == 'worker':
-                    (runtime / 'worker-sentences-v1.py').write_bytes(b'changed worker')
+                    (runtime / 'worker-sentences-v2.py').write_bytes(b'changed worker')
                 elif change == 'permissions':
                     (runtime / 'engine.json').chmod(0o644)
                 elif change == 'dtype':
@@ -406,6 +424,174 @@ class BootstrapTests(unittest.TestCase):
             install.exclusive_rename(source, target)
             self.assertEqual((target / 'marker').read_bytes(), b'new')
             self.assertFalse(source.exists())
+
+
+def legacy_runtime(data):
+    runtime = create_runtime(data)
+    (runtime / setup.WORKER_NAME).rename(runtime / 'worker-sentences-v1.py')
+    record = runtime / 'installation.json'
+    installation = json.loads(record.read_text())
+    installation.pop('workerName')
+    installation.pop('protocolVersion')
+    record.write_text(json.dumps(installation))
+    (runtime / 'settings.json').write_text('{"version":1,"selectedVoice":"af_aoede"}')
+    data.worker.write_bytes(b'# reviewed protocol 2 fixture; never executed\n')
+    return runtime
+
+
+def snapshot(directory):
+    return {str(path.relative_to(directory)): (path.read_bytes(), path.stat().st_mode & 0o777)
+            for path in directory.rglob('*') if path.is_file() and not path.is_symlink()}
+
+
+def migrate(data, **options):
+    arguments = dict(home=data.home, manifest_path=data.manifest, worker_source=data.worker, requirements=data.requirements,
+                     expected_worker_hash=hashlib.sha256(data.worker.read_bytes()).hexdigest())
+    arguments.update(options)
+    with patch.object(setup, 'require_platform'):
+        return setup.upgrade_worker(**arguments)
+
+
+class WorkerMigrationTests(unittest.TestCase):
+    def test_recorded_v1_upgrade_preserves_every_existing_file_and_voice_then_identical_v2_is_noop(self):
+        with fixture() as data:
+            runtime = legacy_runtime(data)
+            before, sources, commands = snapshot(runtime), snapshot(data.cache), list(data.commands)
+            source_bytes = data.worker.read_bytes()
+            self.assertEqual(migrate(data), runtime)
+            after = snapshot(runtime)
+            for name, value in before.items():
+                self.assertEqual(after[name], value)
+            self.assertEqual(set(after) - set(before), {setup.WORKER_NAME, setup.WORKER_MIGRATION_NAME})
+            self.assertEqual(after[setup.WORKER_NAME], (source_bytes, 0o600))
+            metadata = json.loads((runtime / setup.WORKER_MIGRATION_NAME).read_text())
+            self.assertEqual(metadata['workerHash'], hashlib.sha256(source_bytes).hexdigest())
+            self.assertEqual(metadata['protocolVersion'], 2)
+            self.assertEqual(metadata['previousWorkerName'], 'worker-sentences-v1.py')
+            self.assertEqual(metadata['previousWorkerHash'], hashlib.sha256(before['worker-sentences-v1.py'][0]).hexdigest())
+            self.assertEqual(migrate(data), runtime)
+            self.assertEqual(snapshot(runtime), after)
+            self.assertEqual(snapshot(data.cache), sources)
+            self.assertEqual(data.worker.read_bytes(), source_bytes)
+            self.assertEqual(data.commands, commands)
+            self.assertFalse(any(path.name.startswith('.worker-v2-') for path in runtime.iterdir()))
+
+    def test_fresh_v2_installation_records_identity_and_matching_upgrade_is_noop(self):
+        with fixture() as data:
+            runtime = create_runtime(data)
+            installation = json.loads((runtime / 'installation.json').read_text())
+            self.assertEqual(installation['workerName'], setup.WORKER_NAME)
+            self.assertEqual(installation['protocolVersion'], 2)
+            before, commands = snapshot(runtime), list(data.commands)
+            self.assertEqual(migrate(data), runtime)
+            self.assertEqual(snapshot(runtime), before)
+            self.assertEqual(data.commands, commands)
+
+    def test_invalid_runtime_record_assets_original_worker_or_occupied_v2_refuse_without_writes(self):
+        for change in ('asset', 'oldworker', 'requirements', 'metadata', 'metadata_absent', 'worker_name',
+                       'newworker', 'newworker_symlink', 'migration_orphan', 'engine', 'settings', 'permissions',
+                       'oldworker_symlink', 'model_directory_symlink', 'metadata_symlink', 'installed_lock'):
+            with self.subTest(change=change), fixture() as data:
+                runtime = legacy_runtime(data)
+                record = runtime / 'installation.json'
+                if change == 'asset':
+                    (runtime / data.assets[0]['path']).write_bytes(b'changed pinned asset')
+                elif change == 'oldworker':
+                    (runtime / 'worker-sentences-v1.py').write_bytes(b'changed original worker')
+                elif change in ('requirements', 'worker_name'):
+                    metadata = json.loads(record.read_text())
+                    metadata['requirementsHash' if change == 'requirements' else 'workerName'] = '0' * 64 if change == 'requirements' else '../outside.py'
+                    record.write_text(json.dumps(metadata))
+                elif change == 'metadata':
+                    record.write_text('{invalid')
+                elif change == 'metadata_absent':
+                    record.unlink()
+                elif change == 'newworker':
+                    setup.write_private(runtime / setup.WORKER_NAME, b'keep existing different v2')
+                elif change == 'newworker_symlink':
+                    (runtime / setup.WORKER_NAME).symlink_to(data.worker)
+                elif change == 'migration_orphan':
+                    setup.write_private(runtime / setup.WORKER_MIGRATION_NAME, b'preserve recovery metadata')
+                elif change == 'oldworker_symlink':
+                    old = runtime / 'worker-sentences-v1.py'
+                    old.rename(data.root / 'original-worker')
+                    old.symlink_to(data.root / 'original-worker')
+                elif change == 'metadata_symlink':
+                    record.rename(data.root / 'original-installation')
+                    record.symlink_to(data.root / 'original-installation')
+                elif change == 'model_directory_symlink':
+                    models = runtime / 'models'
+                    models.rename(data.root / 'original-models')
+                    models.symlink_to(data.root / 'original-models', target_is_directory=True)
+                elif change == 'installed_lock':
+                    (runtime / 'requirements.lock').write_bytes(b'changed requirements snapshot')
+                elif change == 'engine':
+                    (runtime / 'engine.json').write_text('{"engine":"mlx","dtype":"bfloat16"}')
+                elif change == 'settings':
+                    (runtime / 'settings.json').write_text('{"version":1,"selectedVoice":"bad"}')
+                else:
+                    (runtime / 'settings.json').chmod(0o644)
+                before, source, commands = snapshot(runtime), data.worker.read_bytes(), list(data.commands)
+                with self.assertRaises((OSError, RuntimeError, ValueError)):
+                    migrate(data)
+                self.assertEqual(snapshot(runtime), before)
+                self.assertEqual(data.worker.read_bytes(), source)
+                self.assertEqual(data.commands, commands)
+
+    def test_reviewed_hash_is_required_and_candidate_change_during_asset_checks_is_rejected(self):
+        with fixture() as data:
+            runtime = legacy_runtime(data)
+            before = snapshot(runtime)
+            for value in (None, '', '0' * 64, 'BAD', True):
+                with self.assertRaisesRegex(RuntimeError, 'SHA256|worker-sha256'):
+                    migrate(data, expected_worker_hash=value)
+            digest = setup.file_digest
+            def changed(path):
+                value = digest(path)
+                if Path(path) == runtime / data.assets[-1]['path']:
+                    data.worker.write_bytes(b'candidate changed during validation')
+                return value
+            expected = hashlib.sha256(data.worker.read_bytes()).hexdigest()
+            with patch.object(setup, 'file_digest', side_effect=changed):
+                with self.assertRaisesRegex(RuntimeError, 'changed during'):
+                    migrate(data, expected_worker_hash=expected)
+            self.assertEqual(snapshot(runtime), before)
+
+    def test_original_worker_or_record_changed_during_asset_checks_refuses_before_publication(self):
+        for change in ('worker', 'record'):
+            with self.subTest(change=change), fixture() as data:
+                runtime = legacy_runtime(data)
+                digest = setup.file_digest
+                def changed(path):
+                    value = digest(path)
+                    if Path(path) == runtime / data.assets[-1]['path']:
+                        target = runtime / ('worker-sentences-v1.py' if change == 'worker' else 'installation.json')
+                        target.write_bytes(b'changed by another operation during verification')
+                    return value
+                with patch.object(setup, 'file_digest', side_effect=changed):
+                    with self.assertRaisesRegex(RuntimeError, 'changed during'):
+                        migrate(data)
+                self.assertFalse((runtime / setup.WORKER_NAME).exists())
+                self.assertFalse((runtime / setup.WORKER_MIGRATION_NAME).exists())
+
+    def test_publication_race_preserves_foreign_worker_and_removes_only_owned_new_metadata(self):
+        with fixture() as data:
+            runtime = legacy_runtime(data)
+            before = snapshot(runtime)
+            link = os.link
+            def race(source, destination, **arguments):
+                if destination == setup.WORKER_NAME:
+                    setup.write_private(runtime / setup.WORKER_NAME, b'foreign racing v2')
+                return link(source, destination, **arguments)
+            with patch.object(setup.os, 'link', side_effect=race):
+                with self.assertRaises(FileExistsError):
+                    migrate(data)
+            after = snapshot(runtime)
+            for name, value in before.items():
+                self.assertEqual(after[name], value)
+            self.assertEqual(set(after) - set(before), {setup.WORKER_NAME})
+            self.assertEqual((runtime / setup.WORKER_NAME).read_bytes(), b'foreign racing v2')
+            self.assertFalse(any(path.name.startswith('.worker-v2-') for path in runtime.iterdir()))
 
 
 if __name__ == '__main__':

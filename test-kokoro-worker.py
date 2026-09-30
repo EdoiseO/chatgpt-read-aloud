@@ -38,7 +38,7 @@ class Worker:
         self.reader = threading.Thread(target=self.read, daemon=True)
         self.reader.start()
         ready = self.responses.get(timeout=20)
-        assert ready == {"event": "ready", "engine": "mlx"}, ready
+        assert ready == {"event": "ready", "engine": "mlx", "protocolVersion": 2}, ready
 
     def read(self):
         for line in self.process.stdout:
@@ -125,7 +125,11 @@ def main():
     settings = RUNTIME / "settings.json"
     settings_before = settings.read_bytes() if settings.exists() else None
     source_worker_bytes = (SOURCE / "kokoro_worker.py").read_bytes()
-    runtime_worker_bytes = (RUNTIME / "worker-sentences-v1.py").read_bytes()
+    # A candidate v2 run must preserve an active v1 helper as well as an
+    # already-installed v2 helper. Fresh installations may only contain v2.
+    permanent_workers = [RUNTIME / "worker-sentences-v1.py", RUNTIME / "worker-sentences-v2.py"]
+    runtime_worker_bytes = {path: path.read_bytes() if path.exists() else None for path in permanent_workers}
+    assert any(value is not None for value in runtime_worker_bytes.values()), "No permanent sentence worker is installed"
     checks = []
     audio = []
 
@@ -260,6 +264,26 @@ def main():
                           {"case": "aoede-second-selected-sentence", "generationSeconds": second_seconds, **second_audio}])
             checks.append("Real Aoede default renders two individual selected sentences with exact UTF-16 emoji offsets")
 
+            for pieces in [["}", "After."], ["Before.", "}", "After."], ["Before.", "---"],
+                           ["}", "---", "After."], ["}", "---"]]:
+                text = "\n".join(pieces)
+                ranges, offset = [], 0
+                for piece in pieces:
+                    ranges.append({"start": offset, "end": offset + units(piece)})
+                    offset += units(piece) + 1
+                result = sentences.request(action="start", requestId="silent-ranges", text=text, sentenceRanges=ranges)
+                for index, piece in enumerate(pieces):
+                    value = result["result"]
+                    assert (value["sentenceStart"], value["sentenceEnd"]) == (ranges[index]["start"], ranges[index]["end"])
+                    if piece in {"}", "---"}:
+                        assert value == {"done": False, "skipped": True,
+                                         "sentenceStart": ranges[index]["start"], "sentenceEnd": ranges[index]["end"]}
+                    else:
+                        audio.append({"case": f"aoede-silent-range-{index}-of-{len(pieces)}", **verify_audio(result)})
+                    result = sentences.request(action="next", requestId="silent-ranges")
+                assert result["result"] == {"done": True}
+            checks.append("Protocol 2 acknowledges silent symbol ranges at the start, middle, end, consecutively and alone; following Aoede prose renders normally")
+
             long_sentence = "The selected words stay in order while a long sentence is split into shorter audio pieces " * 5 + "."
             long_range = {"start": 0, "end": units(long_sentence)}
             result = sentences.request(action="start", requestId="long-sentence", text=long_sentence,
@@ -279,12 +303,12 @@ def main():
     settings_after = settings.read_bytes() if settings.exists() else None
     assert settings_after == settings_before, "Production voice settings changed during tests"
     checks.append("Production selection preserved; isolated initial selection stays unset")
-    runtime_worker = RUNTIME / "worker-sentences-v1.py"
-    assert runtime_worker.read_bytes() == runtime_worker_bytes, "Permanent runtime worker was changed during candidate tests"
+    for path, before in runtime_worker_bytes.items():
+        assert (path.read_bytes() if path.exists() else None) == before, "Permanent runtime worker was changed during candidate tests"
     assert (SOURCE / "kokoro_worker.py").read_bytes() == source_worker_bytes
     # A private parent protects the virtual environment; pip package modes need
     # not be rewritten. Check the files holding model and runtime state directly.
-    critical = [runtime_worker, RUNTIME / "engine.json", *[p for p in (RUNTIME / "models").rglob("*") if p.is_file()]]
+    critical = [*[path for path in permanent_workers if path.exists()], RUNTIME / "engine.json", *[p for p in (RUNTIME / "models").rglob("*") if p.is_file()]]
     critical += [p for p in (settings, RUNTIME / "installation.json") if p.exists()]
     private = [p for p in critical if p.is_symlink() or p.stat().st_uid != os.getuid() or p.stat().st_mode & 0o077]
     assert not private and RUNTIME.stat().st_mode & 0o077 == 0

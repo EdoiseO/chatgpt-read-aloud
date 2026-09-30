@@ -48,7 +48,7 @@ class FakeEngine:
         self.prepare_entered.set()
         if self.block_prepare and len(self.prepared) == 1:
             assert self.release.wait(5)
-        return iter(worker.phoneme_chunks(text))
+        return iter([] if text in {"}", "---", "..."} else worker.phoneme_chunks(text))
 
     def render(self, phonemes, voice):
         self.rendered.append((phonemes, voice))
@@ -164,6 +164,45 @@ class SentenceWorkerTests(unittest.TestCase):
         self.assertEqual(engine.prepared[-1], (second, "af_aoede"))
         self.assertEqual(fixture.request(action="next", requestId="long")["result"], {"done": True})
         self.assertEqual("".join(part for part, _ in engine.rendered).replace(" ", ""), text.replace(" ", ""))
+
+    def test_silent_ranges_have_explicit_lazy_outcomes_in_every_position(self):
+        for pieces in [["}", "After."], ["Before.", "}", "After."], ["Before.", "---"],
+                       ["}", "---", "After."], ["}", "---", "..."]]:
+            with self.subTest(pieces=pieces):
+                engine = FakeEngine()
+                fixture = Fixture(self, engine)
+                text = "\n".join(pieces)
+                ranges, offset = [], 0
+                for piece in pieces:
+                    ranges.append({"start": offset, "end": offset + utf16_length(piece)})
+                    offset += utf16_length(piece) + 1
+                result = fixture.request(action="start", requestId="silence", text=text, voice="af_aoede",
+                                         sentenceRanges=ranges)["result"]
+                for index, piece in enumerate(pieces):
+                    self.assertEqual(engine.prepared, [(part, "af_aoede") for part in pieces[:index + 1]])
+                    self.assertEqual((result["sentenceStart"], result["sentenceEnd"]),
+                                     (ranges[index]["start"], ranges[index]["end"]))
+                    if piece in {"}", "---", "..."}:
+                        self.assertEqual(result, {"done": False, "skipped": True,
+                                                  "sentenceStart": ranges[index]["start"], "sentenceEnd": ranges[index]["end"]})
+                    else:
+                        self.assertNotIn("skipped", result)
+                        self.assertIn("audioBase64", result)
+                    result = fixture.request(action="next", requestId="silence")["result"]
+                self.assertEqual(result, {"done": True})
+                self.assertEqual([part for part, _ in engine.rendered], [part for part in pieces if part not in {"}", "---", "..."}])
+
+    def test_cancel_during_silent_prepare_discards_skip_and_old_tail(self):
+        engine = FakeEngine(block_prepare=True)
+        fixture = Fixture(self, engine)
+        rpc = fixture.send(action="start", requestId="silent-old", text="} After.", voice="af_aoede",
+                           sentenceRanges=two_ranges("}", "After."))
+        self.assertTrue(engine.prepare_entered.wait(2))
+        fixture.request(action="cancel", requestId="silent-old")
+        engine.release.set()
+        self.assertEqual(fixture.receive(rpc)["error"]["code"], "CANCELED")
+        self.assertEqual(engine.prepared, [("}", "af_aoede")])
+        self.assertEqual(engine.rendered, [])
 
     def test_cancel_during_prepare_never_tokenizes_future_sentences_or_returns_audio(self):
         engine = FakeEngine(block_prepare=True)

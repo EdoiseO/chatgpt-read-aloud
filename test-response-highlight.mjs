@@ -45,6 +45,42 @@ test('visible prose, link labels, lists and BRs remain readable while code block
   assert.equal(value, 'First bold link label.\n\nOne\nTwo\nline\n\nnext');
 });
 
+test('table headers and numeric cells stay separate with exact unmapped separators', async () => {
+  const value = await documentTest('<div id="response"><table><tr><th>Plan</th><th>Price</th></tr><tr><td>Pro</td><td>$20</td></tr><tr id="numeric"><td>10</td><td>20</td></tr></table></div>', () => {
+    const root = document.querySelector('#response'), row = document.querySelector('#numeric');
+    const map = window.helpers.buildResponseTextMap(root);
+    const range = document.createRange(); range.selectNodeContents(row);
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    const before = getSelection().toString(), selected = window.helpers.captureResponseSelection(root);
+    const highlighter = window.helpers.createResponseHighlighter(selected.map);
+    highlighter.onProgress({ start: 0, end: selected.text.length });
+    const ranges = [...CSS.highlights.get(window.helpers.RESPONSE_HIGHLIGHT_NAME)].map(piece => piece.toString());
+    const result = { text: map.text, selected: selected.text, ranges, unchanged: getSelection().toString() === before };
+    highlighter.dispose(); return result;
+  });
+  assert.deepEqual(value, { text: 'Plan Price\nPro $20\n10 20', selected: '10 20', ranges: ['10', '20'], unchanged: true });
+});
+
+test('partial and cross-row table selections omit hidden/empty/code cells without merging values', async () => {
+  const value = await documentTest('<div id="response"><table><tr><td>First</td><td></td><td hidden>Hidden</td><td><code>x</code></td></tr><tr><td>10</td><td><pre>secret()</pre></td><td>20</td></tr></table></div>', () => {
+    const root = document.querySelector('#response'), cells = root.querySelectorAll('td');
+    const map = window.helpers.buildResponseTextMap(root);
+    const range = document.createRange(); range.setStart(cells[0].firstChild, 2); range.setEnd(cells[6].firstChild, 1);
+    const selected = window.helpers.buildResponseTextMap(root, { range });
+    return { text: map.text, selected: selected.text,
+      ranges: selected.rangesForOffsets(0, selected.text.length).map(piece => piece.toString()) };
+  });
+  assert.deepEqual(value, { text: 'First x\n10\n\n20', selected: 'rst x\n10\n\n2', ranges: ['rst', 'x', '10', '2'] });
+});
+
+test('detached copied HTML tables use the same cell separators', async () => {
+  const value = await documentTest('<div></div>', () => {
+    const document = new DOMParser().parseFromString('<table><tr><th>10</th><th>20</th></tr><tr><td> A </td><td> B </td></tr></table>', 'text/html');
+    return window.helpers.buildResponseTextMap(document.body).text;
+  });
+  assert.equal(value, '10 20\nA B');
+});
+
 test('trimming, collapsed whitespace and UTF-16 emoji offsets retain exact DOM ranges', async () => {
   const value = await documentTest('<div id="response"><p>  Before   😀 <em>café</em>.  </p></div>', () => {
     const map = window.helpers.buildResponseTextMap(document.querySelector('#response'));

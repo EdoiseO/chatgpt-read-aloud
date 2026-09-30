@@ -85,13 +85,20 @@ For an existing installation/update:
    launcher/profile binding. Check that the destination is absent; inspect an
    existing stage rather than overwriting, deleting, or nesting another bundle.
    Use build_copy.py --refresh-copy --target "build/ChatGPT Read Aloud.app".
+   Recompile the staged launcher with configure_launcher.py --app
+   "build/ChatGPT Read Aloud.app" --refresh-launcher. Never configure an installed
+   Applications bundle directly. Verify updater policy and native startup arguments;
+   migrate only the custom domain's saved automatic-update preferences after quit.
    Confirm the private versioned worker matches the canonical source using a
-   supported migration that preserves old workers/settings. If the repository
-   lacks a suitable migration, explain that blocker; do not overwrite an in-use
+   supported --upgrade-worker --worker-sha256 REVIEWED_SHA256 migration that
+   preserves old workers/settings and checks original installation metadata. If
+   the repository lacks a suitable migration, explain that blocker; do not overwrite an in-use
    worker. Verify the stage and run apply_voice_upgrade.py --check.
    Use the existing maintenance checkout and its exact-path journal. If moving
    an installation from another checkout, require a reviewed state migration;
    do not copy/edit reports to make path checks pass or lose prior backup aliases.
+   A pending or invalid recovery journal must block a new activation. Preserve the
+   user's latest valid voice; a staged report's voiceChoice is informational.
 
 7. Finish all preparation and produce a concrete verified stage before telling
    me to Quit. If the stage is ready, schedule the bounded one-shot waiter with

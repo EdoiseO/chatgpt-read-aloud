@@ -147,11 +147,16 @@ export function buildResponseTextMap(root, { range = null } = {}) {
     }
     const breaks = PARAGRAPHS.has(tag) ? 2 : BLOCKS.has(tag) ? 1 : 0;
     if (breaks) boundary(breaks);
+    // Cells have no separating text node in minified/copied HTML. Use an
+    // unmapped space so 10|20 stays two values and highlights stay on real text.
+    const cell = tag === 'TD' || tag === 'TH';
+    if (cell && !pendingSpace) pendingSpace = { char: ' ' };
     let whitespace;
     try { whitespace = view?.getComputedStyle?.(node)?.whiteSpace; } catch { /* Fall back to PRE. */ }
     const preformatted = preserve || /^(pre|pre-wrap|break-spaces)$/.test(whitespace || '');
     for (const child of node.childNodes || []) walk(child, preformatted);
     if (breaks) boundary(breaks);
+    else if (cell && !pendingSpace) pendingSpace = { char: ' ' };
   }
   let blockAncestor = root;
   while (blockAncestor && !isResponseCodeBlock(blockAncestor, view)) blockAncestor = blockAncestor.parentElement;

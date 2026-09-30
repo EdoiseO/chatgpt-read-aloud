@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 
 import apply_voice_upgrade as upgrade
+import runtime_voices
 
 
 HEADER_HASH = 'a' * 64
@@ -46,7 +47,7 @@ def fixture():
                                 launcher=launcher, report=root / 'activation.json',
                                 verification_report=root / 'build-verification.json',
                                 lock=root / 'activation.lock', log=root / 'activation.log')
-        worker = profile.parent / 'kokoro/worker-sentences-v1.py'
+        worker = profile.parent / 'kokoro/worker-sentences-v2.py'
         worker.parent.mkdir(parents=True)
         worker.write_bytes(b'# isolated fixture sentence worker\n')
         worker.chmod(0o600)
@@ -57,7 +58,13 @@ def fixture():
                   'runtimeWorkerPath': str(worker), 'runtimeWorkerHash': hashlib.sha256(worker.read_bytes()).hexdigest(),
                   'asarHeaderHash': HEADER_HASH, 'mainModuleHash': MAIN_HASH}
         config.verification_report.write_text(json.dumps(report))
-        yield config
+        # Installer fixtures validate actual settings without a model/runtime
+        # dependency. The shared helper's bank/hash checks have their own tests.
+        with patch.object(runtime_voices, 'supported_voice_ids',
+                          return_value=frozenset(('af_aoede', 'af_bella', 'af_heart'))), \
+                patch.object(upgrade, 'migrate_update_policy',
+                             return_value={'customPreferencesMigrated': True}):
+            yield config
 
 
 def fake_verify(config, bundle, version=None, require_upgrade=False):
@@ -65,7 +72,10 @@ def fake_verify(config, bundle, version=None, require_upgrade=False):
         raise RuntimeError('Invalid fixture bundle')
     if version is not None and version != 'test-version':
         raise RuntimeError('Mismatched version')
-    return {'CFBundleShortVersionString': 'test-version', 'CodexReadAloudVoicePickerVersion': 1,
+    return {'CFBundleShortVersionString': 'test-version', 'CFBundleIdentifier': upgrade.IDENTITY,
+            'CodexReadAloudLauncherVersion': 2, 'CodexReadAloudUpdaterPolicyVersion': 1,
+            'SUEnableAutomaticChecks': False, 'SUAutomaticallyUpdate': False, 'SUAllowsAutomaticUpdates': False,
+            'CodexReadAloudVoicePickerVersion': 1,
             'CodexReadAloudSelectionHighlightVersion': 1,
             'ElectronAsarIntegrity': {'Resources/app.asar': {'hash': {'old': OLD_HEADER_HASH, 'newer': 'e' * 64}.get((bundle / 'marker').read_text(), HEADER_HASH)}},
             '_mainModuleHash': MAIN_HASH}
@@ -152,6 +162,41 @@ def atomic_record(config):
 
 
 class ActivationTests(unittest.TestCase):
+    def test_updater_preferences_migrate_after_quit_before_publication(self):
+        with fixture() as config:
+            events = []
+            def wait(*_args, **_kwargs):
+                events.append('quit')
+            def migrate(cfg, runner):
+                self.assertEqual(events, ['quit'])
+                self.assertEqual((cfg.target / 'marker').read_text(), 'old')
+                events.append('policy')
+                return {'customPreferencesMigrated': True}
+            def launch(_):
+                self.assertEqual(events, ['quit', 'policy'])
+                events.append('launch')
+            record = upgrade.apply_upgrade(config, verify=fake_verify, blockers=lambda _: [], wait=wait,
+                launch=launch, startup=lambda _: 123, runner=successful_runner, migrate_policy=migrate)
+            self.assertEqual(events, ['quit', 'policy', 'launch'])
+            self.assertTrue(record['updaterPolicyMigration']['customPreferencesMigrated'])
+
+    def test_updater_migration_failure_keeps_old_app_and_is_retryable(self):
+        with fixture() as config:
+            def migrate(*_args):
+                raise RuntimeError('policy migration failed')
+            def no_publication(left, right):
+                if left == config.target or right == config.target:
+                    self.fail('Do not publish before policy migration')
+                upgrade.atomic_exchange(left, right)
+            with self.assertRaisesRegex(RuntimeError, 'policy migration failed'):
+                upgrade.apply_upgrade(config, verify=fake_verify, blockers=lambda _: [], wait=no_wait,
+                    runner=successful_runner, migrate_policy=migrate,
+                    exchange=no_publication,
+                    launch=lambda _: self.fail('Do not launch'))
+            self.assertEqual((config.target / 'marker').read_text(), 'old')
+            self.assertEqual((config.stage / 'marker').read_text(), 'new')
+            self.assertEqual(json.loads(config.report.read_text())['status'], 'recheck_failed')
+
     def test_successful_activation_preserves_backup_and_official_app(self):
         with fixture() as config:
             launches = []
@@ -166,6 +211,182 @@ class ActivationTests(unittest.TestCase):
             self.assertEqual((config.official / 'marker').read_text(), 'official-unchanged')
             self.assertEqual(launches, [config.target])
             self.assertEqual(config.report.stat().st_mode & 0o777, 0o600)
+
+    def test_new_valid_stage_cannot_replace_any_pending_recovery_journal(self):
+        for status in sorted(upgrade.RECOVERY_STATES):
+            with self.subTest(status=status), fixture() as config:
+                record, backup = atomic_record(config)
+                config.target.rename(backup)
+                config.target.mkdir()
+                (config.target / 'marker').write_text('new')
+                record.update(status=status, previousAppPath=str(backup))
+                upgrade.atomic_report(config, record)
+                before = config.report.read_bytes()
+                with patch.object(upgrade, 'preflight', side_effect=AssertionError('No new preflight')):
+                    with self.assertRaisesRegex(RuntimeError, 'previous activation still needs recovery'):
+                        upgrade.apply_upgrade(config, verify=fake_verify,
+                            wait=lambda *args, **kwargs: self.fail('No new waiter'),
+                            exchange=lambda *args: self.fail('No new exchange'))
+                self.assertEqual(config.report.read_bytes(), before)
+                self.assertEqual((backup / 'marker').read_text(), 'old')
+                self.assertEqual((config.target / 'marker').read_text(), 'new')
+                self.assertEqual((config.stage / 'marker').read_text(), 'new')
+                # Discard only the disposable replacement fixture stage. The
+                # original transaction still restores its recorded old bundle.
+                shutil.rmtree(config.stage)
+                upgrade.rollback_saved(config, verify=fake_verify, wait=no_wait,
+                    blockers=lambda _: [], launch=lambda _: None)
+                self.assertEqual((config.target / 'marker').read_text(), 'old')
+                self.assertEqual(json.loads(config.report.read_text())['status'], 'rolled_back')
+
+    def test_completed_and_prepublication_journals_remain_retryable(self):
+        states = ('activated', 'rolled_back', 'waiting_for_quit', 'wait_expired',
+                  'recheck_failed', 'exchange_failed')
+        for status in states:
+            with self.subTest(status=status), fixture() as config:
+                record, _ = atomic_record(config)
+                record['status'] = status
+                upgrade.atomic_report(config, record)
+                result = upgrade.apply_upgrade(config, verify=fake_verify,
+                    blockers=lambda _: [], wait=no_wait, launch=lambda _: None,
+                    startup=lambda _: 1234, runner=successful_runner)
+                self.assertEqual(result['status'], 'activated')
+                self.assertEqual((config.target / 'marker').read_text(), 'new')
+
+    def test_unusable_existing_journals_fail_closed_without_overwriting(self):
+        for change in ('json', 'identity', 'status', 'mode', 'symlink', 'directory', 'fifo'):
+            with self.subTest(change=change), fixture() as config:
+                record, _ = atomic_record(config)
+                if change == 'json':
+                    config.report.write_text('{not json')
+                elif change == 'identity':
+                    upgrade.atomic_report(config, {**record, 'profile': '/other/profile'})
+                elif change == 'status':
+                    upgrade.atomic_report(config, {**record, 'status': 'unknown_phase'})
+                elif change == 'mode':
+                    config.report.chmod(0o644)
+                elif change == 'symlink':
+                    saved = config.report.with_suffix('.saved')
+                    config.report.rename(saved)
+                    config.report.symlink_to(saved)
+                elif change in ('directory', 'fifo'):
+                    config.report.unlink()
+                    if change == 'directory':
+                        config.report.mkdir()
+                    else:
+                        os.mkfifo(config.report)
+                metadata = config.report.lstat()
+                before = config.report.read_bytes() if change not in ('directory', 'fifo') else None
+                with patch.object(upgrade, 'atomic_report', side_effect=AssertionError('No journal writes')):
+                    with self.assertRaisesRegex(RuntimeError, 'existing activation journal is invalid or unreadable'):
+                        upgrade.apply_upgrade(config, verify=fake_verify,
+                            wait=no_wait, runner=successful_runner)
+                self.assertEqual(config.report.lstat(), metadata)
+                if before is not None:
+                    self.assertEqual(config.report.read_bytes(), before)
+                self.assertEqual((config.target / 'marker').read_text(), 'old')
+
+    def test_unreadable_existing_journal_is_not_treated_as_absent(self):
+        with fixture() as config:
+            atomic_record(config)
+            before = config.report.read_bytes()
+            original_open = os.open
+            def denied(path, flags, *args, **kwargs):
+                if Path(path) == config.report:
+                    raise PermissionError('fixture cannot read journal')
+                return original_open(path, flags, *args, **kwargs)
+            with patch.object(upgrade.os, 'open', side_effect=denied):
+                with self.assertRaisesRegex(RuntimeError, 'invalid or unreadable'):
+                    upgrade.apply_upgrade(config, verify=fake_verify, wait=no_wait,
+                                          runner=successful_runner)
+            self.assertEqual(config.report.read_bytes(), before)
+
+    def test_schedule_rejects_pending_recovery_before_verification_or_fork(self):
+        for status in sorted(upgrade.RECOVERY_STATES):
+            with self.subTest(status=status), fixture() as config:
+                record, _ = atomic_record(config)
+                upgrade.atomic_report(config, {**record, 'status': status})
+                before = config.report.read_bytes()
+                with patch.object(upgrade, 'preflight', side_effect=AssertionError('No new preflight')), \
+                        patch.object(upgrade.os, 'pipe', side_effect=AssertionError('No detached waiter')), \
+                        patch.object(upgrade.os, 'fork', side_effect=AssertionError('No fork')):
+                    with self.assertRaisesRegex(RuntimeError, 'previous activation still needs recovery'):
+                        upgrade.schedule_detached(config, 30)
+                self.assertEqual(config.report.read_bytes(), before)
+                self.assertEqual((config.target / 'marker').read_text(), 'old')
+                self.assertEqual((config.stage / 'marker').read_text(), 'new')
+
+    def test_schedule_rejects_unusable_journals_without_detaching_or_overwriting(self):
+        for change in ('json', 'identity', 'status', 'mode', 'symlink', 'directory', 'fifo'):
+            with self.subTest(change=change), fixture() as config:
+                record, _ = atomic_record(config)
+                if change == 'json':
+                    config.report.write_text('{not json')
+                elif change == 'identity':
+                    upgrade.atomic_report(config, {**record, 'profile': '/other/profile'})
+                elif change == 'status':
+                    upgrade.atomic_report(config, {**record, 'status': 'unknown_phase'})
+                elif change == 'mode':
+                    config.report.chmod(0o644)
+                elif change == 'symlink':
+                    saved = config.report.with_suffix('.saved')
+                    config.report.rename(saved)
+                    config.report.symlink_to(saved)
+                else:
+                    config.report.unlink()
+                    config.report.mkdir() if change == 'directory' else os.mkfifo(config.report)
+                metadata = config.report.lstat()
+                before = config.report.read_bytes() if change not in ('directory', 'fifo') else None
+                with patch.object(upgrade, 'preflight', side_effect=AssertionError('No new preflight')), \
+                        patch.object(upgrade.os, 'pipe', side_effect=AssertionError('No detached waiter')), \
+                        patch.object(upgrade.os, 'fork', side_effect=AssertionError('No fork')), \
+                        patch.object(upgrade, 'atomic_report', side_effect=AssertionError('No journal writes')):
+                    with self.assertRaisesRegex(RuntimeError, 'existing activation journal is invalid or unreadable'):
+                        upgrade.schedule_detached(config, 30)
+                self.assertEqual(config.report.lstat(), metadata)
+                if before is not None:
+                    self.assertEqual(config.report.read_bytes(), before)
+                self.assertEqual((config.target / 'marker').read_text(), 'old')
+                self.assertEqual((config.stage / 'marker').read_text(), 'new')
+
+    def test_schedule_rejects_existing_activation_lock_before_fork(self):
+        with fixture() as config:
+            with upgrade.activation_lock(config), \
+                    patch.object(upgrade, 'preflight', side_effect=AssertionError('No new preflight')), \
+                    patch.object(upgrade.os, 'fork', side_effect=AssertionError('No fork')):
+                with self.assertRaisesRegex(RuntimeError, 'activation is already waiting or running'):
+                    upgrade.schedule_detached(config, 30)
+            self.assertFalse(config.report.exists())
+
+    def test_schedule_retryable_state_checks_under_lock_then_releases_before_detach(self):
+        for status in (None, 'activated', 'rolled_back', 'waiting_for_quit', 'wait_expired',
+                       'recheck_failed', 'exchange_failed'):
+            with self.subTest(status=status), fixture() as config:
+                if status is not None:
+                    record, _ = atomic_record(config)
+                    upgrade.atomic_report(config, {**record, 'status': status})
+                before = config.report.read_bytes() if config.report.exists() else None
+                events = []
+                def preflight(cfg):
+                    events.append('preflight')
+                    with self.assertRaisesRegex(RuntimeError, 'activation is already waiting or running'):
+                        with upgrade.activation_lock(cfg):
+                            self.fail('Verification must hold the activation lock')
+                def pipe():
+                    events.append('detach')
+                    with upgrade.activation_lock(config):
+                        pass
+                    raise RuntimeError('fixture stops before any detached process')
+                with patch.object(upgrade, 'preflight', side_effect=preflight), \
+                        patch.object(upgrade, 'verify_exchange_capability', side_effect=lambda _: events.append('swap-probe')), \
+                        patch.object(upgrade.os, 'pipe', side_effect=pipe), \
+                        patch.object(upgrade.os, 'fork', side_effect=AssertionError('No real fork')):
+                    with self.assertRaisesRegex(RuntimeError, 'fixture stops before any detached process'):
+                        upgrade.schedule_detached(config, 30)
+                self.assertEqual(events, ['preflight', 'swap-probe', 'detach'])
+                self.assertEqual(config.report.read_bytes() if config.report.exists() else None, before)
+                self.assertEqual((config.target / 'marker').read_text(), 'old')
+                self.assertEqual((config.stage / 'marker').read_text(), 'new')
 
     def test_running_host_and_cli_are_never_killed_or_replaced(self):
         with fixture() as config:
@@ -333,26 +554,26 @@ class ActivationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'escapes'):
                 upgrade.bundle_info(config, config.target)
 
-    def test_report_voice_choice_requires_matching_private_saved_settings(self):
+    def test_report_voice_snapshot_does_not_override_a_current_valid_choice(self):
         with fixture() as config:
             report = json.loads(config.verification_report.read_text())
             report['voiceChoice'] = 'af_aoede'
             config.verification_report.write_text(json.dumps(report))
-            with self.assertRaisesRegex(RuntimeError, 'not ready'):
-                upgrade.preflight(config, fake_verify, successful_runner)
+            upgrade.preflight(config, fake_verify, successful_runner)
             settings = config.profile.parent / 'kokoro/settings.json'
             settings.parent.mkdir(parents=True, exist_ok=True)
             settings.write_text(json.dumps({'version': 1, 'selectedVoice': 'af_heart'}))
             settings.chmod(0o600)
-            with self.assertRaisesRegex(RuntimeError, 'does not match'):
-                upgrade.preflight(config, fake_verify, successful_runner)
+            before = settings.read_bytes()
+            upgrade.preflight(config, fake_verify, successful_runner)
+            self.assertEqual(settings.read_bytes(), before)
             settings.write_text(json.dumps({'version': 1, 'selectedVoice': 'af_aoede'}))
             before = settings.read_bytes()
             upgrade.preflight(config, fake_verify, successful_runner)
             self.assertEqual(settings.read_bytes(), before)
             self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
             settings.chmod(0o644)
-            with self.assertRaisesRegex(RuntimeError, 'private settings'):
+            with self.assertRaises(RuntimeError):
                 upgrade.preflight(config, fake_verify, successful_runner)
 
     def test_old_reports_without_voice_choice_remain_compatible_and_preferences_are_preserved(self):
@@ -366,6 +587,43 @@ class ActivationTests(unittest.TestCase):
                                   launch=lambda _: None, startup=lambda _: 1234, runner=successful_runner)
             self.assertEqual(settings.read_bytes(), before)
 
+    def test_valid_voice_changes_while_waiting_do_not_abort_or_revert_settings(self):
+        for initial, final in (('af_aoede', 'af_bella'), ('af_aoede', None),
+                               (None, 'af_bella')):
+            with self.subTest(initial=initial, final=final), fixture() as config:
+                report = json.loads(config.verification_report.read_text())
+                report['voiceChoice'] = initial
+                config.verification_report.write_text(json.dumps(report))
+                settings = config.profile.parent / 'kokoro/settings.json'
+                settings.write_text(json.dumps({'version': 1, 'selectedVoice': initial}))
+                settings.chmod(0o600)
+                def change_voice(cfg, timeout, blockers):
+                    settings.write_text(json.dumps({'version': 1, 'selectedVoice': final}))
+                result = upgrade.apply_upgrade(config, verify=fake_verify,
+                    blockers=lambda _: [], wait=change_voice, launch=lambda _: None,
+                    startup=lambda _: 1234, runner=successful_runner)
+                self.assertEqual(result['status'], 'activated')
+                self.assertEqual(json.loads(settings.read_text())['selectedVoice'], final)
+                self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+                self.assertEqual((config.target / 'marker').read_text(), 'new')
+
+    def test_unsupported_or_malformed_voice_during_wait_fails_before_publication(self):
+        for saved in ({'version': 1, 'selectedVoice': 'af_nonexistent'},
+                      {'version': 1, 'selectedVoice': 12},
+                      {'version': 2, 'selectedVoice': 'af_bella'}, ['af_bella']):
+            with self.subTest(saved=saved), fixture() as config:
+                settings = config.profile.parent / 'kokoro/settings.json'
+                settings.write_text(json.dumps({'version': 1, 'selectedVoice': 'af_aoede'}))
+                settings.chmod(0o600)
+                def change_voice(cfg, timeout, blockers):
+                    settings.write_text(json.dumps(saved))
+                with self.assertRaises(RuntimeError):
+                    upgrade.apply_upgrade(config, verify=fake_verify,
+                        blockers=lambda _: [], wait=change_voice,
+                        runner=successful_runner, launch=lambda _: self.fail('No launch'))
+                self.assertEqual(json.loads(config.report.read_text())['status'], 'recheck_failed')
+                self.assertEqual(json.loads(settings.read_text()), saved)
+                self.assertEqual((config.target / 'marker').read_text(), 'old')
     def test_detached_native_helpers_are_not_signaled_while_gui_or_cli_is_alive(self):
         with fixture() as config:
             helper = helper_record(config)
@@ -522,12 +780,27 @@ class ActivationTests(unittest.TestCase):
                     upgrade.preflight(config, verify, successful_runner)
             self.assertEqual((config.target / 'marker').read_text(), 'old')
 
+    def test_stage_requires_updater_policy_launcher_and_disabled_bundle_defaults(self):
+        with fixture() as config:
+            ready = fake_verify(config, config.stage)
+            cases = [( {'CodexReadAloudLauncherVersion': marker}, 'updater-policy launcher')
+                     for marker in (None, 1, '2', True)]
+            cases += [({'CodexReadAloudUpdaterPolicyVersion': None}, 'updater policy')]
+            cases += [({key: value}, 'disable automatic update')
+                      for key in ('SUEnableAutomaticChecks', 'SUAutomaticallyUpdate', 'SUAllowsAutomaticUpdates')
+                      for value in (None, True, 0, 'false')]
+            for changes, message in cases:
+                with self.subTest(changes=changes), patch.object(upgrade, 'bundle_info', return_value={**ready, **changes}):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        upgrade.verify_bundle(config, config.stage, 'test-version', True,
+                                              runner=successful_runner)
+
     def test_sentence_worker_report_requires_exact_path_and_valid_matching_hash(self):
         with fixture() as config:
             original = json.loads(config.verification_report.read_text())
             cases = [
-                {**original, 'runtimeWorkerPath': str(config.official / 'worker-sentences-v1.py')},
-                {**original, 'runtimeWorkerPath': str(config.profile.parent / 'kokoro/worker-sentences-v2.py')},
+                {**original, 'runtimeWorkerPath': str(config.official / 'worker-sentences-v2.py')},
+                {**original, 'runtimeWorkerPath': str(config.profile.parent / 'kokoro/worker-sentences-v1.py')},
                 {key: value for key, value in original.items() if key != 'runtimeWorkerPath'},
                 {**original, 'runtimeWorkerHash': None}, {**original, 'runtimeWorkerHash': 123},
                 {**original, 'runtimeWorkerHash': 'g' * 64}, {**original, 'runtimeWorkerHash': 'a' * 63},
@@ -544,7 +817,7 @@ class ActivationTests(unittest.TestCase):
     def test_sentence_worker_must_exist_be_regular_private_and_not_a_symlink(self):
         for kind in ('missing', 'symlink', 'directory', 'fifo', 'group-readable', 'other-readable'):
             with self.subTest(kind=kind), fixture() as config:
-                worker = config.profile.parent / 'kokoro/worker-sentences-v1.py'
+                worker = config.profile.parent / 'kokoro/worker-sentences-v2.py'
                 if kind in ('missing', 'symlink', 'directory', 'fifo'):
                     worker.unlink()
                 if kind == 'symlink':
@@ -567,7 +840,7 @@ class ActivationTests(unittest.TestCase):
 
     def test_sentence_worker_bytes_and_permissions_are_preserved_during_valid_preflight(self):
         with fixture() as config:
-            worker = config.profile.parent / 'kokoro/worker-sentences-v1.py'
+            worker = config.profile.parent / 'kokoro/worker-sentences-v2.py'
             before = worker.read_bytes(), worker.stat().st_mode & 0o777
             upgrade.preflight(config, fake_verify, successful_runner)
             self.assertEqual((worker.read_bytes(), worker.stat().st_mode & 0o777), before)
@@ -577,7 +850,7 @@ class ActivationTests(unittest.TestCase):
     def test_worker_change_while_waiting_aborts_before_bundle_swap(self):
         with fixture() as config:
             def wait(cfg, timeout, blockers):
-                (cfg.profile.parent / 'kokoro/worker-sentences-v1.py').write_bytes(b'# changed after readiness\n')
+                (cfg.profile.parent / 'kokoro/worker-sentences-v2.py').write_bytes(b'# changed after readiness\n')
             with self.assertRaisesRegex(RuntimeError, 'worker does not match'):
                 upgrade.apply_upgrade(config, verify=fake_verify, blockers=lambda _: [], wait=wait,
                                       launch=lambda _: self.fail('No app may launch'), runner=successful_runner)
@@ -830,6 +1103,7 @@ class ActivationTests(unittest.TestCase):
                 for backup in (prior_backup, older_backup):
                     shutil.copytree(config.target, backup, symlinks=True)
                 record['retainedResourceBackupAliases'] = [str(older_backup)]
+                record['status'] = 'activated'
                 upgrade.atomic_report(config, record)
                 if change == 'cua':
                     (older_backup / upgrade.CUA_ENTRY).write_bytes(b'changed retained code')
@@ -966,7 +1240,7 @@ class ActivationTests(unittest.TestCase):
             waits = []
             def blockers(_):
                 calls[0] += 1
-                return [] if calls[0] == 1 else [100]
+                return [100] if (config.target / 'marker').read_text() == 'new' else []
             def wait(cfg, timeout, blockers):
                 waits.append(True)
                 if len(waits) > 1:

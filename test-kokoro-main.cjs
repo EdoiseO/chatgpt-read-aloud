@@ -22,7 +22,12 @@ class FakeChild extends EventEmitter {
     };
   }
   kill(signal) { this.kills.push(signal); return true; }
+  ready(protocolVersion = 2) {
+    this.readySent = true;
+    this.stdout.emit('data', Buffer.from(`${JSON.stringify({ event: 'ready', protocolVersion, engine: 'mlx' })}\n`));
+  }
   respond(request, result = AUDIO) {
+    if (!this.readySent) this.ready();
     this.stdout.emit('data', Buffer.from(`${JSON.stringify({ rpcId: request.rpcId, result })}\n`));
   }
 }
@@ -150,8 +155,11 @@ test('worker sentence tags must match approved ranges and cannot move backwards'
   const first = f.invoke(event, { action: 'start', requestId: 'ordered', text: 'A. B.',
     sentenceRanges: [{ start: 0, end: 2 }, { start: 3, end: 5 }] });
   const child = f.children[0];
-  child.respond(child.requests.at(-1), { ...AUDIO, sentenceStart: 3, sentenceEnd: 5 });
+  child.respond(child.requests.at(-1), { ...AUDIO, sentenceStart: 0, sentenceEnd: 2 });
   await first;
+  const second = f.invoke(event, { action: 'next', requestId: 'ordered' });
+  child.respond(child.requests.at(-1), { ...AUDIO, sentenceStart: 3, sentenceEnd: 5 });
+  await second;
   const backwards = f.invoke(event, { action: 'next', requestId: 'ordered' });
   const rejected = assert.rejects(backwards, /invalid response/);
   child.respond(child.requests.at(-1), { ...AUDIO, sentenceStart: 0, sentenceEnd: 2 });
@@ -214,14 +222,14 @@ test('detached main frames use fixed offline sandboxed runtime and newline RPC',
   assert.equal(command, '/usr/bin/sandbox-exec');
   assert.deepEqual(args, ['-p', '(version 1)(allow default)(deny network*)',
     '/fixture/user/Library/Application Support/ChatGPT Read Aloud/kokoro/.venv/bin/python', '-u',
-    '/fixture/user/Library/Application Support/ChatGPT Read Aloud/kokoro/worker-sentences-v1.py']);
+    '/fixture/user/Library/Application Support/ChatGPT Read Aloud/kokoro/worker-sentences-v2.py']);
   assert.equal(options.shell, false);
   assert.deepEqual(options.stdio, ['pipe', 'pipe', 'pipe']);
   assert.equal(options.env.HF_HUB_OFFLINE, '1');
   assert.equal(options.env.PYTHONUNBUFFERED, '1');
   assert(!args.join(' ').includes('Read this response.'));
   assert.deepEqual(current.request, { rpcId: 1, action: 'start', requestId: 'response-1', text: 'Read this response.' });
-  const json = `${JSON.stringify({ event: 'ready' })}\n${JSON.stringify({ rpcId: 1, result: AUDIO })}\n`;
+  const json = `${JSON.stringify({ event: 'ready', protocolVersion: 2, engine: 'mlx' })}\n${JSON.stringify({ rpcId: 1, result: AUDIO })}\n`;
   current.child.stdout.emit('data', Buffer.from(json.slice(0, 20)));
   current.child.stdout.emit('data', Buffer.from(json.slice(20)));
   assert.deepEqual(await current.promise, AUDIO);
@@ -323,11 +331,50 @@ test('worker errors expose generic messages without raw stdout or stderr', async
     assert(!error.message.includes('PRIVATE'));
     return true;
   });
+  current.child.ready();
   current.child.stderr.emit('data', Buffer.from('PRIVATE response text in diagnostics'));
   current.child.stdout.emit('data', Buffer.from(`${JSON.stringify({ rpcId: current.request.rpcId,
-    error: { code: 'PRIVATE', message: 'PRIVATE response text and paths' } })}\n`));
+    error: { code: 'SPEECH_FAILED', message: 'PRIVATE response text and paths' } })}\n`));
   await rejected;
   await assert.rejects(f.invoke(current.event, { action: 'next', requestId: 'response-1' }), /does not belong/);
+});
+
+test('exact runtime startup failure offers a safe unavailable message; malformed fatal replies fail closed', async t => {
+  for (const [response, expected] of [
+    [{ event: 'fatal', error: { code: 'RUNTIME_UNAVAILABLE' } }, 'Unable to start local read-aloud worker.'],
+    [{ event: 'fatal', error: true }, 'Local read-aloud worker sent an invalid response.'],
+    [{ event: 'fatal', error: { code: 'PRIVATE' } }, 'Local read-aloud worker sent an invalid response.'],
+    [{ event: 'fatal', error: { code: 'RUNTIME_UNAVAILABLE', message: 'PRIVATE' } }, 'Local read-aloud worker sent an invalid response.'],
+    [{ event: 'fatal', rpcId: 1, error: { code: 'RUNTIME_UNAVAILABLE' } }, 'Local read-aloud worker sent an invalid response.'],
+  ]) {
+    const f = fixture(t);
+    const promise = f.invoke(windowEvent(), { action: 'voices' });
+    const rejected = assert.rejects(promise, error => { assert.equal(error.message, expected); return true; });
+    f.children[0].stdout.emit('data', Buffer.from(JSON.stringify(response) + '\n'));
+    await rejected;
+    assert.deepEqual(f.children[0].kills, ['SIGKILL']);
+  }
+});
+
+test('invalid worker errors cannot be treated as an unavailable model or native fallback', async t => {
+  for (const error of [true, null, [], { code: 'PRIVATE' }, { code: 'SPEECH_FAILED', message: {} },
+    { code: 'SPEECH_FAILED', unexpected: true }]) {
+    const f = fixture(t);
+    const current = start(f);
+    const rejected = assert.rejects(current.promise, /invalid response/);
+    current.child.ready();
+    current.child.stdout.emit('data', Buffer.from(JSON.stringify({ rpcId: current.request.rpcId, error }) + '\n'));
+    await rejected;
+    assert.deepEqual(current.child.kills, ['SIGKILL']);
+  }
+  const f = fixture(t);
+  const current = start(f);
+  const rejected = assert.rejects(current.promise, /rejected the request/);
+  current.child.ready();
+  current.child.stdout.emit('data', Buffer.from(JSON.stringify({ rpcId: current.request.rpcId,
+    error: { code: 'INVALID_TEXT', message: 'PRIVATE' } }) + '\n'));
+  await rejected;
+  assert.deepEqual(current.child.kills, []);
 });
 
 test('malformed JSON, invalid result schemas, and oversized output terminate the worker', async t => {
@@ -478,6 +525,7 @@ test('VOICE_NOT_SELECTED exposes only its fixed safe code and clears active owne
     assert.equal(error.message, 'VOICE_NOT_SELECTED');
     return true;
   });
+  current.child.ready();
   current.child.stdout.emit('data', Buffer.from(`${JSON.stringify({ rpcId: current.request.rpcId,
     error: { code: 'VOICE_NOT_SELECTED', message: 'PRIVATE diagnostics' } })}\n`));
   await rejected;
@@ -552,4 +600,83 @@ test('cross-window start interrupts a final chunk even after prefetched next ret
   other.child.respond(other.request, { done: true });
   await other.promise;
   assert.deepEqual(await f.invoke(other.event, { action: 'cancel', requestId: 'other-window' }), { done: true });
+});
+
+const skip = range => ({ done: false, skipped: true, sentenceStart: range.start, sentenceEnd: range.end });
+const tagged = range => ({ ...AUDIO, sentenceStart: range.start, sentenceEnd: range.end });
+
+test('protocol 2 tracks every silent range without audio and retains multichunk progress', async t => {
+  for (const pattern of [['skip', 'audio'], ['audio', 'skip', 'audio'], ['audio', 'skip'],
+    ['skip', 'skip', 'audio'], ['skip', 'skip'], ['audio', 'repeat', 'skip', 'audio']]) {
+    const f = fixture(t), event = windowEvent();
+    const ranges = pattern.filter(kind => kind !== 'repeat').map((_, index) => ({ start: index * 3, end: index * 3 + 2 }));
+    const text = ranges.map(() => 'x.').join(' ');
+    let pending = f.invoke(event, { action: 'start', requestId: 'coverage', text, sentenceRanges: ranges });
+    const child = f.children[0];
+    let index = -1;
+    for (const kind of pattern) {
+      if (kind !== 'repeat') index++;
+      const result = kind === 'skip' ? skip(ranges[index]) : tagged(ranges[index]);
+      child.respond(child.requests.at(-1), result);
+      assert.deepEqual(await pending, result);
+      pending = f.invoke(event, { action: 'next', requestId: 'coverage' });
+    }
+    child.respond(child.requests.at(-1), { done: true });
+    assert.deepEqual(await pending, { done: true });
+  }
+});
+
+test('invalid skips, gaps, silent repeats and premature completion fail closed', async t => {
+  const ranges = [{ start: 0, end: 2 }, { start: 3, end: 5 }];
+  const cases = [
+    [skip(ranges[1])], [tagged(ranges[1])], [{ done: true }],
+    [{ ...skip(ranges[0]), skipped: 'true' }], [{ ...skip(ranges[0]), audioBase64: AUDIO.audioBase64 }],
+    [{ ...skip(ranges[0]), mimeType: 'audio/wav' }], [{ ...skip(ranges[0]), sentenceEnd: 3 }],
+    [skip(ranges[0]), skip(ranges[0])], [skip(ranges[0]), tagged(ranges[0])],
+    [tagged(ranges[0]), skip(ranges[0])], [tagged(ranges[0]), { done: true }],
+    [skip(ranges[0]), { done: true }], [tagged(ranges[0]), skip(ranges[1]), tagged(ranges[0])],
+    [skip(ranges[0]), skip(ranges[1]), { done: true, skipped: true }],
+  ];
+  for (const sequence of cases) {
+    const f = fixture(t), event = windowEvent();
+    let pending = f.invoke(event, { action: 'start', requestId: 'invalid-skip', text: 'A. B.', sentenceRanges: ranges });
+    const child = f.children[0];
+    for (let index = 0; index < sequence.length; index++) {
+      const bad = index === sequence.length - 1;
+      const rejected = bad ? assert.rejects(pending, /invalid response/) : null;
+      child.respond(child.requests.at(-1), sequence[index]);
+      if (bad) await rejected;
+      else { await pending; pending = f.invoke(event, { action: 'next', requestId: 'invalid-skip' }); }
+    }
+    assert.deepEqual(child.kills, ['SIGKILL']);
+  }
+  const f = fixture(t), current = start(f);
+  const rejected = assert.rejects(current.promise, /invalid response/);
+  current.child.respond(current.request, skip(ranges[0]));
+  await rejected; // Skips without requested ranges cannot prove coverage.
+});
+
+test('missing, wrong and duplicate ready handshakes cannot serve an RPC', async t => {
+  for (const kind of ['missing', 'wrong', 'duplicate']) {
+    const f = fixture(t), current = start(f);
+    const rejected = assert.rejects(current.promise, /invalid response/);
+    if (kind === 'wrong') current.child.ready(1);
+    if (kind === 'duplicate') { current.child.ready(); current.child.ready(); }
+    if (kind === 'missing') current.child.stdout.emit('data', Buffer.from(`${JSON.stringify({ rpcId: current.request.rpcId, result: AUDIO })}\n`));
+    await rejected;
+    assert.deepEqual(current.child.kills, ['SIGKILL']);
+  }
+});
+
+test('canceled silent replies cannot advance a replacement request', async t => {
+  const f = fixture(t), event = windowEvent(), ranges = [{ start: 0, end: 2 }];
+  const old = f.invoke(event, { action: 'start', requestId: 'old-skip', text: '}.', sentenceRanges: ranges });
+  const child = f.children[0], oldRequest = child.requests.at(-1);
+  const canceled = assert.rejects(old, /replaced/);
+  const fresh = f.invoke(event, { action: 'start', requestId: 'new-skip', text: 'A.', sentenceRanges: ranges });
+  await canceled;
+  child.respond(oldRequest, skip(ranges[0]));
+  child.respond(child.requests.at(-1), tagged(ranges[0]));
+  assert.deepEqual(await fresh, tagged(ranges[0]));
+  assert.deepEqual(child.kills, []);
 });

@@ -17,6 +17,7 @@ import sys
 import tempfile
 
 import configure_launcher
+from updater_policy import migrate_custom_preferences
 from build_copy import VERSION
 from setup_runtime import SUPPORT, ensure_home_directory, file_digest, load_manifest, regular_input, require_platform
 
@@ -73,7 +74,7 @@ def verify_completed_runtime(home, manifest_path=ROOT / 'runtime/assets.json', w
         raise RuntimeError('Run setup_runtime.py to create a private speech runtime first.')
     manifest = load_manifest(manifest_path)
     installation = json.loads(private_file(runtime / 'installation.json'))
-    worker = runtime / 'worker-sentences-v1.py'
+    worker = runtime / 'worker-sentences-v2.py'
     if (not isinstance(installation, dict) or installation.get('version') != 1 or installation.get('assets') != manifest['assets']
             or installation.get('requirementsHash') != file_digest(ROOT / 'runtime/requirements.lock')[1]
             or installation.get('workerHash') != file_digest(worker_source)[1]
@@ -171,7 +172,8 @@ def same_directory(path, identity):
 
 
 def install_fresh(config=Config(), runner=subprocess.run, configure=None, verify=verify_staged_app,
-                  runtime_verify=verify_completed_runtime, publish=exclusive_rename):
+                  runtime_verify=verify_completed_runtime, publish=exclusive_rename, migrate_policy=None):
+    migrate_policy = migrate_custom_preferences if migrate_policy is None else migrate_policy
     require_platform()
     configure = configure_launcher.main if configure is None else configure
     for path, description in ((config.target, 'The installation target'), (config.profile, 'The dedicated profile'),
@@ -201,6 +203,7 @@ def install_fresh(config=Config(), runner=subprocess.run, configure=None, verify
             shutil.copytree(config.app, stage, symlinks=True)
             configure(app=stage, profile=config.profile, register=False)
             verify(stage, Path(folder) / 'verification.json', runner)
+            migrate_policy(stage, home=config.home, runner=runner)
             # All verification and launcher preparation precede publication.
             require_absent(config.target, 'The installation target')
             descriptor = os.open(config.launcher, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o700)

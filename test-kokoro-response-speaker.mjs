@@ -784,3 +784,162 @@ test("progress view callback failures cannot break audio cleanup or final comple
   assert.equal(f.audios[0].disposeCalls, 1);
   assert.deepEqual(f.errors, []);
 });
+
+const skippedChunk = range => ({ done: false, skipped: true, sentenceStart: range.start, sentenceEnd: range.end });
+
+test("silent sentences in every position advance without audio or highlighting", async () => {
+  for (const pattern of [["skip", "audio"], ["audio", "skip", "audio"], ["audio", "skip"],
+    ["skip", "skip", "audio"], ["skip", "skip"], ["audio", "repeat", "skip", "audio"]]) {
+    const f = fixture(), progress = [];
+    const ranges = pattern.filter(kind => kind !== "repeat").map((_, index) => ({ start: index * 3, end: index * 3 + 2 }));
+    const text = ranges.map(() => "x.").join(" ");
+    f.speaker.toggle(f.keyA, text, { sentenceRanges: ranges, onProgress: value => progress.push(value) });
+    await settle();
+    let index = -1, audioIndex = 0, rpc = f.starts[0];
+    const expectedProgress = [];
+    for (const kind of pattern) {
+      if (kind !== "repeat") index++;
+      rpc.resolve(kind === "skip" ? skippedChunk(ranges[index]) : rangedChunk("fixture", ranges[index]));
+      await settle();
+      if (kind !== "skip") {
+        expectedProgress.push(ranges[index]);
+        assert.deepEqual(progress, expectedProgress);
+        f.audios[audioIndex++].onended();
+        expectedProgress.push(null);
+        await settle();
+      }
+      assert.deepEqual(progress, expectedProgress);
+      rpc = f.nexts.at(-1);
+    }
+    rpc.resolve({ done: true });
+    await settle();
+    assert.equal(f.statesA.at(-1), false);
+    assert.equal(f.audios.length, pattern.filter(kind => kind !== "skip").length);
+    assert.deepEqual(progress.filter(Boolean), expectedProgress.filter(Boolean));
+    assert.equal(f.fallbackCalls.length, 0);
+    assert.deepEqual(f.errors, []);
+  }
+});
+
+test("skip validation rejects forged audio, unknown ranges, repeats, gaps and premature done", async () => {
+  const ranges = [{ start: 0, end: 2 }, { start: 3, end: 5 }];
+  for (const sequence of [
+    [skippedChunk(ranges[1])], [{ ...skippedChunk(ranges[0]), audioBase64: "YWJj" }],
+    [{ ...skippedChunk(ranges[0]), skipped: 1 }], [{ ...skippedChunk(ranges[0]), mimeType: "audio/wav" }],
+    [{ ...skippedChunk(ranges[0]), sentenceEnd: 3 }], [{ done: true }],
+    [skippedChunk(ranges[0]), skippedChunk(ranges[0])], [skippedChunk(ranges[0]), rangedChunk("bad", ranges[0])],
+    [skippedChunk(ranges[0]), { done: true }],
+    [skippedChunk(ranges[0]), skippedChunk(ranges[1]), { done: true, skipped: true }],
+  ]) {
+    const f = fixture(), progress = [];
+    f.speaker.toggle(f.keyA, "A. B.", { sentenceRanges: ranges, fallback: false, onProgress: value => progress.push(value) });
+    await settle();
+    let rpc = f.starts[0];
+    for (const result of sequence) { rpc.resolve(result); await settle(); rpc = f.nexts.at(-1); }
+    assert.equal(f.audios.length, 0);
+    assert.equal(f.statesA.at(-1), false);
+    assert.equal(f.errors.length, 1);
+    assert.deepEqual(progress.filter(Boolean), []);
+  }
+  const noRanges = fixture();
+  noRanges.speaker.toggle(noRanges.keyA, "A.", { fallback: false });
+  await settle();
+  noRanges.starts[0].resolve(skippedChunk(ranges[0]));
+  await settle();
+  assert.equal(noRanges.audios.length, 0);
+  assert.equal(noRanges.errors.length, 1);
+});
+
+test("stop and switch during silent traversal ignore stale skips", async () => {
+  const f = fixture(), progressA = [], progressB = [];
+  const ranges = [{ start: 0, end: 2 }, { start: 3, end: 5 }];
+  f.speaker.toggle(f.keyA, "}. A.", { sentenceRanges: ranges, onProgress: value => progressA.push(value) });
+  await settle();
+  f.starts[0].resolve(skippedChunk(ranges[0]));
+  await settle();
+  const stale = f.nexts[0];
+  f.speaker.stop();
+  f.speaker.toggle(f.keyB, "B.", { sentenceRanges: [ranges[0]], onProgress: value => progressB.push(value) });
+  await settle();
+  stale.resolve(skippedChunk(ranges[1]));
+  f.starts[1].resolve(rangedChunk("B", ranges[0]));
+  await settle();
+  assert.equal(f.audios.length, 1);
+  assert.deepEqual(progressA.filter(Boolean), []);
+  assert.deepEqual(progressB, [ranges[0]]);
+  assert.equal(f.cancellations.filter(id => id === f.starts[0].id).length, 1);
+  f.speaker.stop();
+});
+
+test("explicit native mode bypasses the helper, retains selected text, and stops and switches normally", async () => {
+  const f = fixture(), progress = [];
+  f.speaker.toggle(f.keyA, " Chosen. ", { mode: "native", sentenceRanges: [{ start: 1, end: 8 }], onProgress: value => progress.push(value) });
+  await settle();
+  assert.equal(f.starts.length, 0);
+  assert.equal(f.audios.length, 0);
+  assert.equal(f.fallbackCalls[0].text, " Chosen. ");
+  assert.deepEqual(progress.filter(Boolean), []);
+  assert.equal(f.statesA.at(-1), true);
+  f.speaker.toggle(f.keyA, " Chosen. ", { mode: "native" });
+  assert.equal(f.statesA.at(-1), false);
+  assert.equal(f.fallbackStops, 1);
+  assert.equal(f.cancellations.length, 0, "an explicit native request never started a helper request to cancel");
+  f.speaker.toggle(f.keyB, "New.", { mode: "native" });
+  await settle();
+  f.endFallback();
+  assert.equal(f.statesB.at(-1), false);
+  assert.deepEqual(f.errors, []);
+});
+
+test("an audio sentence cannot later be skipped or omitted from completion", async () => {
+  const ranges = [{ start: 0, end: 2 }, { start: 3, end: 5 }, { start: 6, end: 8 }];
+  for (const result of [skippedChunk(ranges[0]), skippedChunk(ranges[2]), { done: true }]) {
+    const f = fixture(), progress = [];
+    f.speaker.toggle(f.keyA, "A. B. C.", { sentenceRanges: ranges, onProgress: value => progress.push(value) });
+    await settle();
+    f.starts[0].resolve(rangedChunk("A", ranges[0]));
+    await settle();
+    f.nexts[0].resolve(result);
+    f.audios[0].onended();
+    await settle();
+    assert.equal(f.audios.length, 1);
+    assert.deepEqual(progress, [ranges[0], null]);
+    assert.equal(f.fallbackCalls.length, 0, "spoken text must not replay through native speech");
+    assert.equal(f.errors.length, 1);
+    assert.equal(f.statesA.at(-1), false);
+  }
+});
+
+test("a direct response switch abandons pending silent traversal and its late rejection", async () => {
+  const f = fixture(), ranges = [{ start: 0, end: 2 }, { start: 3, end: 5 }];
+  f.speaker.toggle(f.keyA, "}. A.", { sentenceRanges: ranges });
+  await settle();
+  f.starts[0].resolve(skippedChunk(ranges[0]));
+  await settle();
+  f.speaker.toggle(f.keyB, "B.", { sentenceRanges: [ranges[0]] });
+  await settle();
+  f.nexts[0].reject(new Error("old helper terminated"));
+  f.starts[1].resolve(rangedChunk("B", ranges[0]));
+  await settle();
+  assert.equal(f.audios.length, 1);
+  assert.equal(f.statesB.at(-1), true);
+  assert.deepEqual(f.errors, []);
+  assert.deepEqual(f.fallbackCalls, []);
+  f.speaker.stop();
+});
+
+test("native mode validates ranges and reports unavailable native speech without starting the helper", async () => {
+  const f = fixture({ withFallback: false });
+  f.speaker.toggle(f.keyA, "A.", { mode: "native", sentenceRanges: [{ start: 0, end: 2 }] });
+  await settle();
+  assert.equal(f.starts.length, 0);
+  assert.deepEqual(f.cancellations, [], "explicit native speech must not contact the failed helper");
+  assert.equal(f.statesA.at(-1), false);
+  assert.match(f.errors[0], /Native speech is unavailable/);
+  const invalid = fixture();
+  invalid.speaker.toggle(invalid.keyA, "A. B.", { mode: "native", fallback: false, sentenceRanges: [{ start: 0, end: 2 }] });
+  await settle();
+  assert.equal(invalid.starts.length, 0);
+  assert.deepEqual(invalid.fallbackCalls, []);
+  assert.match(invalid.errors[0], /sentence ranges are invalid/);
+});

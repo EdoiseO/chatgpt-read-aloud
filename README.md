@@ -12,6 +12,7 @@ own profile.
 - Follow a **soft yellow highlight** as each sentence plays.
 - Stop playback or switch to another response.
 - Preview and save your choice of **28 English voices**.
+- Choose **Use Mac voice** if the local speech helper cannot start.
 
 Speech runs locally with **[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)**.
 **Aoede (`af_aoede`)** is the voice used in our demos; you can choose another.

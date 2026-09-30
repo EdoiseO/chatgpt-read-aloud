@@ -1,4 +1,4 @@
-// The bridge returns one WAV chunk per start()/next() call, or { done: true }.
+// The bridge returns a WAV chunk, an explicit skipped sentence, or { done: true }.
 // createAudio receives a data URL and returns an HTMLAudio-like object. An
 // adapter that uses a Blob URL can expose dispose() to revoke that URL.
 export function createKokoroResponseSpeaker({ backend, createAudio, fallback, onError = () => {} }) {
@@ -53,21 +53,29 @@ export function createKokoroResponseSpeaker({ backend, createAudio, fallback, on
     return result;
   }
 
-  function chunkSentence(request, chunk) {
-    if (!request.sentenceRanges) return null;
+  function chunkSentence(request, chunk, skipped = false) {
+    if (!request.sentenceRanges) {
+      if (skipped || chunk.sentenceStart !== undefined || chunk.sentenceEnd !== undefined) {
+        throw new Error("The local speech helper returned invalid sentence progress.");
+      }
+      return null;
+    }
     const start = chunk.sentenceStart, end = chunk.sentenceEnd;
     if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) {
       throw new Error("The local speech helper returned invalid sentence progress.");
     }
     const index = request.sentenceIndexes.get(`${start}:${end}`);
-    if (index === undefined || index < request.lastSentenceIndex || index > request.lastSentenceIndex + 1) {
+    if (index === undefined || index < request.lastSentenceIndex || index > request.lastSentenceIndex + 1
+        || (index === request.lastSentenceIndex && (skipped || request.lastSentenceSkipped))) {
       throw new Error("The local speech helper returned invalid sentence progress.");
     }
     request.lastSentenceIndex = index;
+    request.lastSentenceSkipped = skipped;
     return request.sentenceRanges[index];
   }
 
   function cancelBackend(request) {
+    if (request.native) return;
     if (request.cancelRequested) return;
     request.cancelRequested = true;
     try {
@@ -113,7 +121,7 @@ export function createKokoroResponseSpeaker({ backend, createAudio, fallback, on
   }
 
   function playChunk(request, chunk) {
-    if (!chunk || chunk.done !== false || typeof chunk.audioBase64 !== "string" || !chunk.audioBase64) {
+    if (!chunk || chunk.done !== false || chunk.skipped !== undefined || typeof chunk.audioBase64 !== "string" || !chunk.audioBase64) {
       throw new Error("The local speech helper returned no audio.");
     }
     if (chunk.mimeType != null && chunk.mimeType !== "audio/wav") {
@@ -211,6 +219,7 @@ export function createKokoroResponseSpeaker({ backend, createAudio, fallback, on
         request.rangesInput = null;
         request.sentenceIndexes = new Map(request.sentenceRanges.map((range, index) => [`${range.start}:${range.end}`, index]));
       }
+      if (request.native) { startFallback(request, new Error("Native speech is unavailable.")); return; }
       if (!backend || typeof backend.start !== "function" || typeof backend.next !== "function"
           || typeof createAudio !== "function") {
         throw new Error("The local speech helper is unavailable.");
@@ -224,7 +233,24 @@ export function createKokoroResponseSpeaker({ backend, createAudio, fallback, on
           : backend.start(request.id, request.text);
       });
       while (isCurrent(request) && request.mode === "kokoro") {
-        if (chunk?.done === true) { finish(request); return; }
+        if (chunk?.done === true) {
+          if (chunk.skipped !== undefined || chunk.audioBase64 !== undefined || chunk.mimeType !== undefined ||
+              chunk.sentenceStart !== undefined || chunk.sentenceEnd !== undefined ||
+              (request.sentenceRanges && request.lastSentenceIndex !== request.sentenceRanges.length - 1)) {
+            throw new Error("The local speech helper returned incomplete sentence progress.");
+          }
+          finish(request); return;
+        }
+        if (chunk?.skipped === true) {
+          if (chunk.done !== false || chunk.audioBase64 !== undefined || chunk.mimeType !== undefined) {
+            throw new Error("The local speech helper returned invalid silent sentence progress.");
+          }
+          // Every skip consumes exactly the next approved range. This bounds
+          // no-audio traversal by the validated range count (at most 4096).
+          chunkSentence(request, chunk, true);
+          chunk = await backendCall(request, () => backend.next(request.id));
+          continue;
+        }
         const finished = playChunk(request, chunk);
         chunk = null;
         // Keep exactly one chunk ahead. Promise.all attaches a rejection handler
@@ -264,10 +290,10 @@ export function createKokoroResponseSpeaker({ backend, createAudio, fallback, on
       const request = {
         id: `${prefix}-${++sequence}`, key, text: readable, voice: options?.voice, active: true,
         allowFallback: options?.fallback !== false,
-        mode: "kokoro", played: false, cancelRequested: false,
+        mode: "kokoro", native: options?.mode === "native", played: false, cancelRequested: false,
         aborted, abort, releaseAudio: null, unsubscribeFallback: null,
         hasSentenceRanges, rangesInput: options?.sentenceRanges, sentenceRanges: null,
-        sentenceIndexes: null, lastSentenceIndex: -1,
+        sentenceIndexes: null, lastSentenceIndex: -1, lastSentenceSkipped: false,
         onProgress: typeof options?.onProgress === "function" ? options.onProgress : null,
         progress: undefined,
       };

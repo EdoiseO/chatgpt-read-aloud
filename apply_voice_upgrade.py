@@ -28,6 +28,9 @@ import tempfile
 import time
 
 from asar_integrity import patch_integrity_slot
+from runtime_voices import read_saved_voice
+from updater_policy import migrate_custom_preferences
+from updater_policy import validate_bundle_policy
 
 
 ROOT = Path(__file__).resolve().parent
@@ -45,6 +48,12 @@ CUA_ENTRY = CUA_ROOT / 'lib/node_modules/@oai/cua-repl/bin/cua-repl.mjs'
 AT_FDCWD = -2  # Darwin sys/fcntl.h
 RENAME_SWAP = 0x00000002  # Darwin sys/stdio.h
 MAX_RETAINED_RESOURCE_ALIASES = 8
+RECOVERY_STATES = frozenset(('rollback_pending_quit', 'rollback_waiting_for_quit',
+                             'exchanging', 'exchanged', 'verifying_startup',
+                             'rolled_back_recovery_pending'))
+TRANSACTION_STATES = RECOVERY_STATES | frozenset(('waiting_for_quit', 'wait_expired',
+                                                'recheck_failed', 'exchange_failed',
+                                                'activated', 'rolled_back'))
 
 
 @dataclass(frozen=True)
@@ -138,7 +147,8 @@ def bundle_info(config, bundle, expected_version=None):
         raise RuntimeError('Unexpected custom-app identity or executable.')
     if expected_version is not None and info.get('CFBundleShortVersionString') != expected_version:
         raise RuntimeError('The staged and installed custom-app versions differ.')
-    if (info.get('CodexReadAloudLauncherVersion') != 1 or
+    if (type(info.get('CodexReadAloudLauncherVersion')) is not int
+            or info['CodexReadAloudLauncherVersion'] not in (1, 2) or
             info.get('LSEnvironment', {}).get('CODEX_ELECTRON_USER_DATA_PATH') != str(config.profile)):
         raise RuntimeError('The custom app is not bound to its existing dedicated profile.')
     for name in ('ChatGPT', 'ChatGPT-native'):
@@ -155,6 +165,10 @@ def verify_bundle(config, bundle, expected_version=None, require_upgrade=False, 
     if require_upgrade and (type(info.get('CodexReadAloudSelectionHighlightVersion')) is not int
                             or info['CodexReadAloudSelectionHighlightVersion'] != 1):
         raise RuntimeError('The staged app is missing the verified selection-highlight version marker.')
+    if require_upgrade:
+        if type(info.get('CodexReadAloudLauncherVersion')) is not int or info['CodexReadAloudLauncherVersion'] != 2:
+            raise RuntimeError('The staged app is missing the verified updater-policy launcher.')
+        validate_bundle_policy(info)
     checked_run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(bundle)], runner)
     framework = contained_path(bundle, Path('Contents/Frameworks/Codex Framework.framework/Versions/Current/Codex Framework'))
     integrity = info['ElectronAsarIntegrity']
@@ -276,21 +290,39 @@ def retained_backup_paths(config, record):
     return tuple(dict.fromkeys(valid_backup_path(config, value) for value in values))
 
 
-def transaction_record(config):
+def transaction_record(config, *, strict=False):
+    """Inspect a private journal; absence and unusable existing state differ.
+
+    Resource/process proofs can conservatively ignore an invalid journal. An
+    activation must instead fail closed before replacing any existing record.
+    """
     try:
-        metadata = config.report.lstat()
-        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
-                or metadata.st_mode & 0o077):
-            return {}
-        record = json.loads(config.report.read_text())
+        config.report.lstat()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        if strict:
+            raise RuntimeError('The existing activation journal is invalid or unreadable; preserve it and inspect recovery before retrying.') from None
+        return {}
+    try:
+        descriptor = os.open(config.report, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'r') as stream:
+            metadata = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                    or metadata.st_mode & 0o077):
+                raise RuntimeError('The activation journal is not private.')
+            record = json.load(stream)
         if (not isinstance(record, dict) or record.get('app') != str(config.target) or record.get('stage') != str(config.stage)
                 or record.get('profile') != str(config.profile)
-                or record.get('transaction') != 'atomic_exchange_v1'):
-            return {}
+                or record.get('transaction') != 'atomic_exchange_v1'
+                or record.get('status') not in TRANSACTION_STATES):
+            raise RuntimeError('The activation journal identity is invalid.')
         valid_backup_path(config, record.get('backup'))
         retained_backup_paths(config, record)
         return record
-    except (OSError, ValueError, TypeError, RuntimeError):
+    except (OSError, ValueError, TypeError, UnicodeError, RuntimeError):
+        if strict:
+            raise RuntimeError('The existing activation journal is invalid or unreadable; preserve it and inspect recovery before retrying.') from None
         return {}
 
 
@@ -714,7 +746,7 @@ def activation_lock(config):
 
 
 def verify_runtime_worker(config, readiness):
-    worker = config.profile.parent / 'kokoro/worker-sentences-v1.py'
+    worker = config.profile.parent / 'kokoro/worker-sentences-v2.py'
     digest = readiness.get('runtimeWorkerHash')
     if (readiness.get('runtimeWorkerPath') != str(worker)
             or not isinstance(digest, str) or re.fullmatch(r'[0-9a-f]{64}', digest) is None):
@@ -755,17 +787,10 @@ def preflight(config, verify=verify_bundle, runner=subprocess.run):
             or readiness.get('mainModuleHash') != staged.get('_mainModuleHash')):
         raise RuntimeError('The staged voice-build verification report does not match this ready build.')
     verify_runtime_worker(config, readiness)
-    expected_voice = readiness.get('voiceChoice')
-    if expected_voice is not None:
-        if (not isinstance(expected_voice, str) or len(expected_voice) > 64
-                or re.fullmatch(r'(?:af|am|bf|bm)_[a-z0-9]+', expected_voice) is None):
-            raise RuntimeError('The verified reading-voice choice is invalid.')
-        settings = config.profile.parent / 'kokoro/settings.json'
-        if settings.is_symlink() or not settings.is_file() or settings.stat().st_mode & 0o077:
-            raise RuntimeError('The private settings for the chosen reading voice are not ready.')
-        saved = json.loads(settings.read_text())
-        if not isinstance(saved, dict) or saved.get('selectedVoice') != expected_voice:
-            raise RuntimeError('The saved reading voice does not match the verified choice.')
+    # voiceChoice is an informational snapshot, not part of bundle identity.
+    # Validate the current private preference against the installed voice bank;
+    # preserve a valid later choice (or no choice) while waiting for user quit.
+    read_saved_voice(config.profile.parent / 'kokoro')
     if config.stage.parent.stat().st_dev != config.target.parent.stat().st_dev:
         raise RuntimeError('The staged app is on another filesystem; atomic activation is unavailable.')
     checked_run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(config.official)], runner)
@@ -816,11 +841,21 @@ def restore_previous(config, record, previous, wait_seconds, verify, wait, block
     return restored
 
 
+def migrate_update_policy(config, runner=subprocess.run):
+    if config.profile != Path.home() / 'Library/Application Support/ChatGPT Read Aloud/user-data':
+        raise RuntimeError('Updater migration requires the current user dedicated profile.')
+    return migrate_custom_preferences(config.stage, home=Path.home(), runner=runner)
+
+
 def apply_upgrade(config, wait_seconds=1800, verify=verify_bundle, blockers=process_blockers,
                   wait=wait_until_stopped, launch=launch_existing, startup=validate_startup,
-                  runner=subprocess.run, exchange=None):
+                  runner=subprocess.run, exchange=None, migrate_policy=None):
+    migrate_policy = migrate_update_policy if migrate_policy is None else migrate_policy
     exchange = atomic_exchange if exchange is None else exchange
     with activation_lock(config):
+        prior_record = transaction_record(config, strict=True)
+        if prior_record.get('status') in RECOVERY_STATES:
+            raise RuntimeError('A previous activation still needs recovery; preserve its journal and run --rollback before preparing another upgrade.')
         installed, staged = preflight(config, verify, runner)
         verify_exchange_capability(exchange)
         stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -829,7 +864,6 @@ def apply_upgrade(config, wait_seconds=1800, verify=verify_bundle, blockers=proc
             raise RuntimeError('The reversible backup destination already exists.')
         # Read the prior private journal before replacing it. Shared-daemon CUA
         # helpers can still map an earlier successful backup across many updates.
-        prior_record = transaction_record(config)
         resource_cache = {}
         dock_hashes = unchanged_dock_hashes(config, resource_cache, prior_record)
         cua_manifest = unchanged_cua_proof(config, prior_record, resource_cache)[0]
@@ -862,6 +896,9 @@ def apply_upgrade(config, wait_seconds=1800, verify=verify_bundle, blockers=proc
                 raise RuntimeError('A verified app bundle changed while waiting; recheck the staged upgrade.')
             if blockers(config):
                 raise RuntimeError('The custom app restarted; no in-use bundle was replaced.')
+            record['updaterPolicyMigration'] = migrate_policy(config, runner)
+            if blockers(config):
+                raise RuntimeError('The custom app restarted during updater migration; no bundle was replaced.')
         except Exception:
             atomic_report(config, {**record, 'status': 'recheck_failed'})
             raise
@@ -904,9 +941,8 @@ def rollback_saved(config, wait_seconds=1800, verify=verify_bundle,
                    wait=wait_until_stopped, blockers=process_blockers, launch=launch_existing, exchange=None):
     exchange = atomic_exchange if exchange is None else exchange
     with activation_lock(config):
-        record = transaction_record(config)
-        if record.get('status') not in ('rollback_pending_quit', 'rollback_waiting_for_quit', 'exchanging', 'exchanged', 'verifying_startup',
-                                      'rolled_back_recovery_pending'):
+        record = transaction_record(config, strict=True)
+        if record.get('status') not in RECOVERY_STATES:
             raise RuntimeError('There is no pending rollback for this custom app.')
         verify_exchange_capability(exchange)
         backup = valid_backup_path(config, record['backup'])
@@ -945,8 +981,15 @@ def rollback_saved(config, wait_seconds=1800, verify=verify_bundle,
 
 
 def schedule_detached(config, wait_seconds):
-    preflight(config)
-    verify_exchange_capability(atomic_exchange)
+    # Fail before detaching or asking the user to quit when an existing
+    # transaction needs recovery. Release the lock before fork: the child
+    # acquires its own lock and repeats this check in apply_upgrade.
+    with activation_lock(config):
+        record = transaction_record(config, strict=True)
+        if record.get('status') in RECOVERY_STATES:
+            raise RuntimeError('A previous activation still needs recovery; preserve its journal and run --rollback before preparing another upgrade.')
+        preflight(config)
+        verify_exchange_capability(atomic_exchange)
     executable = Path(sys.executable).resolve(strict=True)
     if any(executable.is_relative_to(root.resolve()) for root in (config.target, config.stage)):
         raise RuntimeError('Run the activation script with a system Python outside the custom app.')

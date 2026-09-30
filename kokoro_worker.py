@@ -19,6 +19,7 @@ logging.disable(logging.CRITICAL)
 OUTPUT_LOCK = threading.Lock()
 MAX_TEXT = 200000
 MAX_SENTENCE_RANGES = 4096
+PROTOCOL_VERSION = 2
 JS_NON_WHITESPACE = re.compile(r"[^\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]")
 
 
@@ -290,11 +291,20 @@ class Service:
             with self.condition:
                 if self.current is not context:
                     return
+            had_phonemes = False
             for phonemes in self.engine.prepare(text[python_start:python_end], context["voice"]):
                 with self.condition:
                     if self.current is not context:
                         return
+                had_phonemes = True
                 yield phonemes, start, end
+            if not had_phonemes and start is not None:
+                # The tokenizer may omit symbols entirely. Report that exact
+                # approved sentence as silent instead of jumping over it.
+                with self.condition:
+                    if self.current is not context:
+                        return
+                yield None, start, end
 
     def work(self):
         while True:
@@ -319,7 +329,8 @@ class Service:
                 except StopIteration:
                     result = {"done": True}
                 else:
-                    result = self.engine.render(phonemes, context["voice"])
+                    result = ({"done": False, "skipped": True} if phonemes is None
+                              else self.engine.render(phonemes, context["voice"]))
                     if sentence_start is not None:
                         result["sentenceStart"] = sentence_start
                         result["sentenceEnd"] = sentence_end
@@ -353,7 +364,7 @@ def main():
         reply({"event": "fatal", "error": {"code": "RUNTIME_UNAVAILABLE"}})
         return 1
     service = Service(engine, ROOT)
-    reply({"event": "ready", "engine": engine.kind})
+    reply({"event": "ready", "engine": engine.kind, "protocolVersion": PROTOCOL_VERSION})
     try:
         for line in sys.stdin:
             if len(line) > 1500000:

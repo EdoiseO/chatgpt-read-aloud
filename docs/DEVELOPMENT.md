@@ -17,9 +17,10 @@ installation and demos. It is a supplied Kokoro voice, not a custom recording.
 The picker offers 28 English voices. A fresh installation has no voice selected:
 preview and choose one. The saved choice survives a normal Quit and reopen.
 
-After setup, local speech runs in a network-denied worker. Native macOS speech
-can be a fallback and clears the synchronized local highlight. First playback
-may take several seconds while the model loads. ChatGPT/Codex's normal response
+After setup, local speech runs in a network-denied worker. If initial voice
+lookup fails, **Use Mac voice** offers deliberate native speech for the captured
+passage. It preserves the local voice choice and has no synchronized highlight.
+First playback may take several seconds while the model loads. ChatGPT/Codex's normal response
 generation still uses OpenAI. See [third-party notices](../THIRD_PARTY.md) for
 component licenses.
 
@@ -38,10 +39,27 @@ filters blocks, and its Markdown fallback removes fenced blocks.
 Unstructured copied text without HTML or Markdown fences cannot reliably
 distinguish code from prose; the connected desktop view is the primary path.
 
-Code exclusion avoids the reproduced interruption caused by brace-only code
-lines producing no phonemes. Separate symbol-only lines in ordinary prose can
-still expose the speech controller's existing progress limitation. Inline
-operator pronunciation is handled as prose and may be simplified.
+Protocol v2 explicitly reports sentences that produce no phonemes, so silent
+symbol-only prose no longer interrupts following sentences. Worker, bridge, and
+renderer validate exact contiguous sentence coverage; silent ranges receive no
+audio or highlight. The versioned v2 worker preserves compatibility with older
+copies still using v1. Inline operator pronunciation may still be simplified.
+Table cells have unmapped spaces between values, with row breaks and exact DOM
+highlight offsets preserved.
+
+## Update and recovery controls
+
+The custom bundle disallows automatic downloads, and its native launcher sets
+both automatic checks and downloads off in the macOS argument preferences domain.
+Activation also migrates those two saved preferences in the custom bundle's
+domain after quit. The official app's updater is independent. These controls do
+not block a manual upstream update; use the supported staged rebuild procedure.
+
+Build and launcher utilities accept scratch stages. Verification uses explicit
+exceptions, including under optimized Python, and reports staged/installed scope.
+Unresolved or invalid recovery journals block a new activation; missing journals
+are distinct from malformed ones. A valid voice change while waiting is retained
+and validated against the pinned voice bank, rather than a stale report snapshot.
 
 ## Development and verification
 

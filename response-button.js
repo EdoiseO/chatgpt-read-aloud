@@ -105,12 +105,40 @@ function codexReadableResponseText(html, fallback) {
     return "";
   }
 }
+function codexVoiceHelperUnavailable(error) {
+  // Electron invoke may prefix the main process's fixed message. Invalid
+  // metadata/protocol and trust errors must not offer a different speech path.
+  const message = typeof error?.message === "string" ? error.message : "";
+  return [
+    "Unable to start local read-aloud worker.",
+    "Local read-aloud worker stopped.",
+    "Local read-aloud worker timed out.",
+    "Local read-aloud is unavailable.",
+    "Unable to generate local read-aloud audio.",
+  ].some(fixed => message === fixed || message.endsWith(": " + fixed));
+}
+function codexValidVoiceSettings(settings) {
+  try {
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) return false;
+    const id = settings.selectedVoice;
+    const validId = voice => typeof voice === "string" && /^(?:af|am|bf|bm)_[a-z0-9]+$/.test(voice);
+    if (id !== null && !validId(id)) return false;
+    if (settings.voices !== undefined) {
+      if (!Array.isArray(settings.voices) || settings.voices.length > 64) return false;
+      const ids = settings.voices.map(voice => voice?.id);
+      if (!ids.every(validId) || new Set(ids).size !== ids.length || id !== null && !ids.includes(id)) return false;
+    }
+    return (settings.speed === undefined || settings.speed === 1) &&
+      (settings.engine === undefined || ["mlx", "onnx"].includes(settings.engine));
+  } catch { return false; }
+}
 function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
   const React = Fo();
   const [active, setActive] = React.useState(false);
   const [checking, setChecking] = React.useState(false);
   const [pickerOpen, setPickerOpen] = React.useState(false);
   const [selectionPresent, setSelectionPresent] = React.useState(false);
+  const [nativeOffer, setNativeOffer] = React.useState(null);
   const token = React.useRef(null);
   const activeNow = React.useRef(false);
   const mounted = React.useRef(false);
@@ -184,14 +212,16 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
     return text ? { text } : null;
   }
 
-  function startRead(read) {
+  function startRead(read, mode = "kokoro") {
     highlight.current?.dispose(); highlight.current = null;
-    const nextHighlight = read.map ? createResponseHighlighter(read.map) : null;
+    const nextHighlight = mode !== "native" && read.map ? createResponseHighlighter(read.map) : null;
     try {
-      speaker.toggle(token.current, read.text, read.map ? {
-        sentenceRanges: read.sentenceRanges,
-        onProgress: progress => nextHighlight.onProgress(progress),
-      } : undefined);
+      const options = mode === "native" ? {
+        mode: "native", ...(read.map ? { sentenceRanges: read.sentenceRanges } : {}),
+      } : read.map ? {
+        sentenceRanges: read.sentenceRanges, onProgress: progress => nextHighlight.onProgress(progress),
+      } : undefined;
+      speaker.toggle(token.current, read.text, options);
       if (mounted.current && activeNow.current) highlight.current = nextHighlight;
       else nextHighlight?.dispose();
     } catch {
@@ -216,27 +246,53 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
       owner: token.current,
       cancel() {
         pendingRead.current = null;
-        if (mounted.current) { setChecking(false); setPickerOpen(false); }
+        if (mounted.current) { setChecking(false); setPickerOpen(false); setNativeOffer(null); }
       },
     };
     codexReadAloudSelection = selection;
     setChecking(true);
+    let settings;
     try {
-      const settings = await bridge.getVoices();
+      if (typeof bridge?.getVoices !== "function") throw new Error("Local read-aloud is unavailable.");
+      settings = await bridge.getVoices();
+    } catch (error) {
       if (!mounted.current || codexReadAloudSelection !== selection) return;
       setChecking(false);
-      if (typeof settings?.selectedVoice === "string" && settings.selectedVoice) {
-        codexReadAloudSelection = null;
-        startRead(read);
-      } else if (settings?.selectedVoice === null) {
+      if (codexVoiceHelperUnavailable(error)) {
         pendingRead.current = read;
-        setPickerOpen(true);
-      } else throw new Error("Voice selection unavailable");
-    } catch {
-      if (!mounted.current || codexReadAloudSelection !== selection) return;
+        setNativeOffer({ selection, read });
+      } else {
+        codexCancelReadAloudSelection();
+        globalThis.alert("Could not load local voices. Please try again.");
+      }
+      return;
+    }
+    if (!mounted.current || codexReadAloudSelection !== selection) return;
+    setChecking(false);
+    if (!codexValidVoiceSettings(settings)) {
       codexCancelReadAloudSelection();
       globalThis.alert("Could not load local voices. Please try again.");
+    } else if (settings.selectedVoice !== null) {
+      codexReadAloudSelection = null;
+      startRead(read);
+    } else {
+      pendingRead.current = read;
+      setPickerOpen(true);
     }
+  }
+
+  function useMacVoice(event, offer) {
+    event.stopPropagation();
+    if (!mounted.current || !offer || codexReadAloudSelection !== offer.selection ||
+        pendingRead.current !== offer.read) return;
+    const read = offer.read;
+    codexCancelReadAloudSelection();
+    startRead(read, "native");
+  }
+
+  function dismissMacVoice(event, offer) {
+    event.stopPropagation();
+    if (offer && codexReadAloudSelection === offer.selection) codexCancelReadAloudSelection();
   }
 
   function captureBeforeFocus(event) {
@@ -260,7 +316,7 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
     return beginRead(null, false, captured);
   }
 
-  const busy = active || checking;
+  const busy = active || checking || nativeOffer !== null;
   const label = busy ? "Stop reading aloud" : selectionPresent ? "Read aloud" : "Read this response aloud";
   const icon = busy
     ? Y.jsx("rect", { x: 6, y: 6, width: 12, height: 12, rx: 1 })
@@ -318,6 +374,18 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
         if (codexReadAloudSelection?.owner === token.current) codexReadAloudSelection = null;
         if (mounted.current && read) startRead(read);
       },
+    }) : null, nativeOffer ? Y.jsxs("span", {
+      role: "alert", "data-codex-local-read-aloud": "native-status",
+      className: "inline-flex items-center gap-2 text-xs",
+      children: [
+        Y.jsx("span", { children: "Local speech is unavailable." }),
+        Y.jsx("button", { type: "button", className: "rounded px-2 py-1 underline",
+          "data-codex-local-read-aloud": "use-native", onClick: event => useMacVoice(event, nativeOffer),
+          children: "Use Mac voice" }),
+        Y.jsx("button", { type: "button", className: "rounded px-2 py-1 underline",
+          "data-codex-local-read-aloud": "dismiss-native", onClick: event => dismissMacVoice(event, nativeOffer),
+          children: "Dismiss" }),
+      ],
     }) : null],
   });
 }

@@ -178,16 +178,24 @@ or its in-use archive.
    only after checking that this destination is absent and no build/update is
    modifying the source. If a stage already exists, inspect it rather than
    deleting or nesting another app inside it.
-3. Confirm that the private versioned worker matches the new canonical worker
-   source. `setup_runtime.py` is a first-setup tool and refuses an existing
-   runtime. If a worker migration is needed, use a reviewed migration that
-   preserves settings and the previous worker needed by an earlier app. Do not
-   overwrite a worker used by a running app to satisfy readiness checks.
+3. Confirm that `worker-sentences-v2.py` matches the reviewed canonical source.
+   Recorded bootstrap installations can migrate without replacing the old worker:
+
+   ```sh
+   shasum -a 256 kokoro_worker.py
+   python3.13 setup_runtime.py --upgrade-worker --worker-sha256 REVIEWED_SHA256
+   ```
+
+   Replace `REVIEWED_SHA256` with the reviewed source digest. The migration verifies
+   original installation metadata and pinned assets, preserves v1/settings/models,
+   and refuses a differing existing v2. Older hand-built runtimes without metadata
+   require a separate reviewed migration; never fabricate their installation record.
 4. Refresh and verify the separate stage:
 
    ```sh
    python3 build_copy.py --refresh-copy \
      --target "build/ChatGPT Read Aloud.app"
+   python3 configure_launcher.py --app "build/ChatGPT Read Aloud.app" --refresh-launcher
    python3 verify_voice_build.py
    python3 apply_voice_upgrade.py --check
    ```
@@ -214,9 +222,17 @@ The stopped-app update uses an atomic directory exchange, preserves the previous
 custom bundle under a timestamped backup name, reopens the existing profile, and
 checks startup for 30 seconds. Its local report is
 `voice-upgrade-activation.json`. `waiting_for_quit` is not success;
-`activated` with the startup proof is the expected result. A saved voice may be
-recorded as an optional readiness binding; absence of a saved choice is valid
-for a first-time picker flow and must not force a default voice.
+`activated` with the startup proof is the expected result. The current valid
+reading voice is preserved even if it changed while waiting. A report's voice
+snapshot is informational; no saved choice remains valid for the first-time picker.
+Unresolved, unreadable, or invalid recovery journals block a new activation.
+Complete recorded recovery before preparing another transaction.
+
+After quit and before publication, activation disables the custom copy's saved
+automatic update checks/downloads. Bundle policy and native startup arguments
+enforce this restriction on reopen. Manual upstream updates remain unsupported:
+these controls do not block a user-initiated install. The official app's settings
+are untouched. Inspect `updaterPolicy` in the verification report.
 
 If rollback is pending after a failed upgraded launch, inspect the report and
 quit the custom app normally before using the installer's documented recovery:

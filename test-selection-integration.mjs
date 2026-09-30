@@ -26,8 +26,8 @@ async function isolated(markup, run) {
     await page.evaluate(({ source, menu }) => {
       const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
       let hooks;
-      const starts = [], nexts = [], cancels = [], audios = [], alerts = [], voiceJobs = [], voiceChecks = [];
-      let interruption, holdVoices = false;
+      const starts = [], nexts = [], cancels = [], audios = [], alerts = [], voiceJobs = [], voiceChecks = [], voiceSaves = [], nativeUtterances = [];
+      let interruption, holdVoices = false, nativeEnabled = false, nativeCancels = 0;
       const react = {
         useState(initial) { const index = hooks.index++, state = hooks; if (!(index in state.slots)) state.slots[index] = initial; return [state.slots[index], value => { state.slots[index] = value; }]; },
         useRef(initial) { const index = hooks.index++; if (!(index in hooks.slots)) hooks.slots[index] = { current: initial }; return hooks.slots[index]; },
@@ -38,8 +38,12 @@ async function isolated(markup, run) {
       window.Dr = window.HT = 'button'; window.qi = 'tooltip';
       window.CodexReadAloudVoicePicker = () => {};
       window.alert = message => alerts.push(message);
-      window.speechSynthesis = { cancel() {}, getVoices() { return []; }, speak() { throw new Error('Unexpected Apple fallback'); } };
-      window.SpeechSynthesisUtterance = undefined;
+      const synthesis = { cancel() { nativeCancels++; }, getVoices() { return []; },
+        speak(utterance) { if (!nativeEnabled) throw new Error('Unexpected Apple fallback'); nativeUtterances.push(utterance); } };
+      // speechSynthesis is a getter on Window; plain assignment can leave the
+      // browser's real API intact. Explicitly replace it for every test page.
+      Object.defineProperty(window, 'speechSynthesis', { configurable: true, value: synthesis });
+      Object.defineProperty(window, 'SpeechSynthesisUtterance', { configurable: true, writable: true, value: undefined });
       window.Audio = class {
         constructor(src) { this.src = src; this.started = deferred(); this.paused = false; this.disposed = false; audios.push(this); }
         play() { return this.started.promise; }
@@ -54,6 +58,7 @@ async function isolated(markup, run) {
         start(id, text, options) { const job = { id, text, options, ...deferred() }; starts.push(job); return job.promise; },
         next(id) { const job = { id, ...deferred() }; nexts.push(job); return job.promise; },
         cancel(id) { cancels.push(id); return Promise.resolve({ done: true }); },
+        setVoice(voice) { voiceSaves.push(voice); return Promise.resolve({ selectedVoice: voice }); },
         onInterrupted(callback) { interruption = callback; return () => { interruption = null; }; },
       };
       window.eval(source + '\nwindow.__actualComponent=CodexLocalReadAloudButton;');
@@ -91,9 +96,11 @@ async function isolated(markup, run) {
       const fire = (node, type, init = {}) => node.dispatchEvent(type.startsWith('pointer') ? new PointerEvent(type, { bubbles: true, cancelable: true, button: 0, ...init }) : new MouseEvent(type, { bubbles: true, cancelable: true, button: 0, detail: type === 'click' ? 1 : 0, ...init }));
       const highlighted = () => { const highlight = CSS.highlights.get('codex-read-aloud-active-sentence'); return highlight ? [...highlight].map(range => range.toString()).join('') : null; };
       const chunk = (request, index = 0) => ({ done: false, mimeType: 'audio/wav', audioBase64: 'AA==', sentenceStart: request.options.sentenceRanges[index].start, sentenceEnd: request.options.sentenceRanges[index].end });
-      window.fixture = { mount, select, tick, fire, highlighted, starts, nexts, cancels, audios, alerts, voiceJobs, voiceChecks, chunk,
+      window.fixture = { mount, select, tick, fire, highlighted, starts, nexts, cancels, audios, alerts, voiceJobs, voiceChecks, voiceSaves, nativeUtterances, chunk,
         menu(root, range) { const tree = makeMenu(root, range); const node = treeNode(tree); if (node) document.body.append(node); return node; },
         holdVoices(value) { holdVoices = value; }, interrupt(id) { interruption?.({ requestId: id }); },
+        enableNative() { nativeEnabled = true; window.SpeechSynthesisUtterance = class { constructor(text) { this.text = text; } }; },
+        get nativeCancels() { return nativeCancels; },
       };
     }, { source: sources, menu: selectionButton });
     return await page.evaluate(run);
@@ -313,4 +320,87 @@ test('raw-only Markdown fallback skips closed and streamed fences without DOMPar
     return { text, requests: f.starts.length, voiceChecks: f.voiceChecks.length, alerts: f.alerts };
   });
   assert.deepEqual(value, { text: 'Before `inline()`.\n\nAfter.', requests: 1, voiceChecks: 1, alerts: [] });
+});
+
+test('explicit Mac speech preserves a selected mixed passage after focus loss, skips code, and never highlights or invokes the helper', async () => {
+  const value = await isolated('<div id="response"><p>Outside. Selected before.</p><pre><code>neverRead();\n}</code></pre><p>Selected after. Outside tail.</p></div>', async () => {
+    const f = fixture; f.enableNative(); f.holdVoices(true);
+    const root = document.querySelector('#response'), before = root.innerHTML, mounted = f.mount(root), paragraphs = root.querySelectorAll('p');
+    const range = document.createRange(); range.setStart(paragraphs[0].firstChild, 9); range.setEnd(paragraphs[1].firstChild, 15);
+    getSelection().removeAllRanges(); getSelection().addRange(range); document.dispatchEvent(new Event('selectionchange')); mounted.render();
+    f.fire(mounted.button, 'pointerdown'); getSelection().removeAllRanges(); mounted.button.focus();
+    f.fire(mounted.button, 'mousedown'); f.fire(mounted.button, 'click'); await f.tick();
+    f.voiceJobs[0].reject(new Error('Local read-aloud worker timed out.')); await f.tick();
+    const host = mounted.render(), alert = host.querySelector('[role="alert"]');
+    const offered = alert.textContent, beforeChoice = f.nativeUtterances.length;
+    const nativeButton = host.querySelector('[data-codex-local-read-aloud="use-native"]'); nativeButton.focus();
+    f.fire(nativeButton, 'click'); await f.tick(); mounted.render();
+    const text = f.nativeUtterances[0]?.text, highlight = f.highlighted(), stopsBefore = f.nativeCancels;
+    const staleEnd = f.nativeUtterances[0].onend;
+    f.fire(mounted.button, 'click'); await f.tick(); staleEnd(); await f.tick(); mounted.render();
+    return { offered, beforeChoice, text, highlight, stopped: f.nativeCancels > stopsBefore,
+      statusCleared: !host.querySelector('[data-codex-local-read-aloud="native-status"]'),
+      noHelperCalls: f.starts.length === 0 && f.nexts.length === 0 && f.cancels.length === 0,
+      noAudio: f.audios.length === 0, voiceChecks: f.voiceChecks.length, voiceSaves: f.voiceSaves.length,
+      nativeSelection: getSelection().toString(), markupUnchanged: root.innerHTML === before, alerts: f.alerts };
+  });
+  assert.deepEqual(value, { offered: 'Local speech is unavailable.Use Mac voiceDismiss', beforeChoice: 0,
+    text: 'Selected before.\n\nSelected after.', highlight: null, stopped: true, statusCleared: true,
+    noHelperCalls: true, noAudio: true, voiceChecks: 1, voiceSaves: 0, nativeSelection: '', markupUnchanged: true, alerts: [] });
+});
+
+test('dismissed and superseded native offers cannot widen selection or cancel another response', async () => {
+  const value = await isolated('<div id="a">Response A.</div><div id="b">Response B.</div>', async () => {
+    const f = fixture; f.enableNative(); f.holdVoices(true);
+    const a = f.mount(document.querySelector('#a')), b = f.mount(document.querySelector('#b'));
+    f.fire(a.button, 'click'); await f.tick(); f.voiceJobs[0].reject(new Error('Local read-aloud worker stopped.')); await f.tick();
+    let host = a.render(), oldUse = host.querySelector('[data-codex-local-read-aloud="use-native"]');
+    f.fire(host.querySelector('[data-codex-local-read-aloud="dismiss-native"]'), 'click'); await f.tick();
+    const dismissed = !a.render().querySelector('[role="alert"]'); f.fire(oldUse, 'click'); await f.tick();
+    const afterDismiss = f.nativeUtterances.length;
+    f.fire(a.button, 'click'); await f.tick(); f.voiceJobs[1].reject(new Error('Local read-aloud worker stopped.')); await f.tick();
+    host = a.render(); oldUse = host.querySelector('[data-codex-local-read-aloud="use-native"]');
+    const oldDismiss = host.querySelector('[data-codex-local-read-aloud="dismiss-native"]');
+    f.fire(b.button, 'click'); await f.tick(); f.voiceJobs[2].reject(new Error('Unable to start local read-aloud worker.')); await f.tick();
+    const bHost = b.render(); f.fire(oldUse, 'click'); f.fire(oldDismiss, 'click'); await f.tick();
+    const bOfferPreserved = !!bHost.querySelector('[data-codex-local-read-aloud="use-native"]');
+    f.fire(bHost.querySelector('[data-codex-local-read-aloud="use-native"]'), 'click'); await f.tick();
+    a.unmount(); const playingB = b.render().querySelector('[data-codex-local-read-aloud="response"]').getAttribute('aria-pressed');
+    return { dismissed, afterDismiss, bOfferPreserved, texts: f.nativeUtterances.map(utterance => utterance.text), playingB,
+      helperCalls: f.starts.length + f.nexts.length + f.cancels.length, voiceSaves: f.voiceSaves.length,
+      highlight: f.highlighted(), alerts: f.alerts };
+  });
+  assert.deepEqual(value, { dismissed: true, afterDismiss: 0, bOfferPreserved: true, texts: ['Response B.'], playingB: 'true',
+    helperCalls: 0, voiceSaves: 0, highlight: null, alerts: [] });
+});
+
+test('unavailable native API reports failure after explicit choice without reopening lookup or speaking through the helper', async () => {
+  const value = await isolated('<div id="response">Held passage.</div>', async () => {
+    const f = fixture; f.holdVoices(true); const mounted = f.mount(document.querySelector('#response'));
+    f.fire(mounted.button, 'click'); await f.tick(); f.voiceJobs[0].reject(new Error('Local read-aloud worker stopped.')); await f.tick();
+    const host = mounted.render(); f.fire(host.querySelector('[data-codex-local-read-aloud="use-native"]'), 'click'); await f.tick();
+    mounted.render();
+    return { offerCleared: !host.querySelector('[role="alert"]'), inactive: mounted.button.getAttribute('aria-pressed'),
+      helperCalls: f.starts.length + f.nexts.length + f.cancels.length, voiceChecks: f.voiceChecks.length,
+      voiceSaves: f.voiceSaves.length, highlight: f.highlighted(), alerts: f.alerts };
+  });
+  assert.deepEqual(value, { offerCleared: true, inactive: 'false', helperCalls: 0, voiceChecks: 1,
+    voiceSaves: 0, highlight: null, alerts: ['Unable to read this response aloud. Please try again.'] });
+});
+
+test('malformed voice metadata and a late failure after unmount never offer native speech', async () => {
+  const value = await isolated('<div id="response">Selected passage.</div><div id="other">Other.</div>', async () => {
+    const f = fixture; f.enableNative(); f.holdVoices(true); const mounted = f.mount(document.querySelector('#response'));
+    f.fire(mounted.button, 'click'); await f.tick(); f.voiceJobs[0].resolve({ selectedVoice: 'af_unknown', voices: [{ id: 'af_aoede' }] }); await f.tick();
+    const noMalformedOffer = !mounted.render().querySelector('[role="alert"]');
+    f.fire(mounted.button, 'click'); await f.tick(); f.voiceJobs[1].resolve({ selectedVoice: null }); await f.tick();
+    const noNullOffer = !mounted.render().querySelector('[data-codex-local-read-aloud="use-native"]');
+    f.fire(mounted.button, 'click'); await f.tick(); // Cancel the held picker read.
+    f.fire(mounted.button, 'click'); await f.tick(); mounted.unmount();
+    f.voiceJobs[2].reject(new Error('Local read-aloud worker stopped.')); await f.tick();
+    return { noMalformedOffer, noNullOffer, nativeCount: f.nativeUtterances.length,
+      helperCalls: f.starts.length + f.nexts.length + f.cancels.length, voiceSaves: f.voiceSaves.length, alerts: f.alerts };
+  });
+  assert.deepEqual(value, { noMalformedOffer: true, noNullOffer: true, nativeCount: 0,
+    helperCalls: 0, voiceSaves: 0, alerts: ['Could not load local voices. Please try again.'] });
 });

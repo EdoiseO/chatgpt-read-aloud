@@ -28,11 +28,17 @@ int main(int argc, char **argv) {
     char profile_argument[PATH_MAX + 32];
     written = snprintf(profile_argument, sizeof(profile_argument), "--user-data-dir=%s", READ_ALOUD_PROFILE);
     if (written < 0 || (size_t)written >= sizeof(profile_argument)) return 1;
-    char **native_args = calloc((size_t)argc + 3, sizeof(char *));
+    char **native_args = calloc((size_t)argc + 7, sizeof(char *));
     if (!native_args) return 1;
     native_args[0] = native;
     native_args[1] = profile_argument;
-    size_t count = 2;
+    // NSUserDefaults' argument domain overrides old saved Sparkle settings.
+    // Only the custom copy receives these arguments; official updates remain independent.
+    native_args[2] = "-SUEnableAutomaticChecks";
+    native_args[3] = "NO";
+    native_args[4] = "-SUAutomaticallyUpdate";
+    native_args[5] = "NO";
+    size_t count = 6;
     for (int i = 1; i < argc; i++) {
         // Avoid conflicting profile arguments from an external launch command.
         if (strncmp(argv[i], "--user-data-dir=", sizeof("--user-data-dir=") - 1) == 0) continue;
@@ -40,6 +46,21 @@ int main(int argc, char **argv) {
             if (i + 1 < argc) i++;
             continue;
         }
+        const char *update_keys[] = { "-SUEnableAutomaticChecks", "-SUAutomaticallyUpdate" };
+        int updater_option = 0;
+        for (size_t key = 0; key < sizeof(update_keys) / sizeof(update_keys[0]); key++) {
+            size_t length = strlen(update_keys[key]);
+            if (strcmp(argv[i], update_keys[key]) == 0) {
+                if (i + 1 < argc) i++;
+                updater_option = 1;
+                break;
+            }
+            if (strncmp(argv[i], update_keys[key], length) == 0 && argv[i][length] == '=') {
+                updater_option = 1;
+                break;
+            }
+        }
+        if (updater_option) continue;
         native_args[count++] = argv[i];
     }
     native_args[count] = NULL;

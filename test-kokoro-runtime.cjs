@@ -93,6 +93,21 @@ test('packaged main bridge uses one offline worker, all voices, and final-chunk 
       assert.equal(secondSentence.sentenceEnd, sentenceText.length);
       assert.deepEqual(await handle(a, { action: 'next', requestId: 'runtime-sentences' }), { done: true });
       await handle(a, { action: 'cancel', requestId: 'runtime-sentences' });
+      const silentText = 'Before.\n}\n---\nAfter.';
+      const silentRanges = [{ start: 0, end: 7 }, { start: 8, end: 9 }, { start: 10, end: 13 }, { start: 14, end: 20 }];
+      const silentRequest = { action: 'start', requestId: 'runtime-silent', text: silentText, sentenceRanges: silentRanges };
+      if (expectedSelection === null) silentRequest.voice = 'af_bella';
+      verifyWav(await handle(a, silentRequest));
+      for (const range of silentRanges.slice(1, 3)) {
+        assert.deepEqual(await handle(a, { action: 'next', requestId: 'runtime-silent' }),
+          { done: false, skipped: true, sentenceStart: range.start, sentenceEnd: range.end });
+      }
+      const afterSilent = await handle(a, { action: 'next', requestId: 'runtime-silent' });
+      verifyWav(afterSilent);
+      assert.equal(afterSilent.sentenceStart, 14);
+      assert.equal(afterSilent.sentenceEnd, 20);
+      assert.deepEqual(await handle(a, { action: 'next', requestId: 'runtime-silent' }), { done: true });
+      await handle(a, { action: 'cancel', requestId: 'runtime-silent' });
       assert.equal((await handle(a, { action: 'voices' })).selectedVoice, expectedSelection);
       assert.equal(children.length, 1);
       const afterSettings = fs.existsSync(settingsFile) ? fs.readFileSync(settingsFile) : null;
@@ -100,7 +115,7 @@ test('packaged main bridge uses one offline worker, all voices, and final-chunk 
       fs.writeFileSync(path.join(__dirname, 'test-kokoro-runtime-results.json'), JSON.stringify({
         realMainToWorkerPassed: true, networkDenied: true, voices: 28,
         selectedVoice: expectedSelection, usedSavedVoiceWithoutOverride: expectedSelection !== null,
-        audioCases: 4, usSeconds, ukSeconds,
+        audioCases: 6, usSeconds, ukSeconds, consecutiveSilentRangesVerified: true,
         sentenceChunksVerified: true, firstSentenceSeconds, secondSentenceSeconds,
         singleWorker: true, finalChunkCrossWindowInterruption: true,
         productionSettingsUnchanged: true, elapsedSeconds: (Date.now() - started) / 1000,
