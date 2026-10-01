@@ -138,6 +138,36 @@ function hasNativeOffer(tree) {
   return found;
 }
 
+test('host action visibility follows lookup, playback, Stop, and voice-picker state', async () => {
+  const f = fixture();
+  let visibility;
+  const response = f.mount('CodexLocalReadAloudButton', {
+    getText: () => 'Keep Stop available while this response is playing.',
+    renderContent(pair, state) { visibility = { ...state }; return pair; },
+  });
+  response.render();
+  assert.deepEqual(visibility, { busy: false, pickerOpen: false });
+  const pending = read(response.render()).props.onClick(event());
+  response.render();
+  assert.deepEqual(visibility, { busy: true, pickerOpen: false });
+  f.jobs[0].resolve({ selectedVoice: 'af_aoede' });
+  await pending;
+  const playing = response.render();
+  assert.equal(read(playing).props['aria-label'], 'Stop reading aloud');
+  assert.deepEqual(visibility, { busy: true, pickerOpen: false });
+  await read(playing).props.onClick(event());
+  response.render();
+  assert.deepEqual(visibility, { busy: false, pickerOpen: false });
+  settings(response.render()).props.onClick(event());
+  const choosing = response.render();
+  assert.deepEqual(visibility, { busy: false, pickerOpen: true });
+  picker(choosing).props.onClose();
+  response.render();
+  assert.deepEqual(visibility, { busy: false, pickerOpen: false });
+  assert.equal(f.toggles.length, 1);
+  response.unmount();
+});
+
 test('selection-only rendering keeps voice choice and fallback dialogs outside the suppressed pair', async () => {
   for (const unavailable of [false, true]) {
     const f = fixture();

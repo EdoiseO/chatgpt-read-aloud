@@ -509,16 +509,18 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot, getTextRoots,
   // lifetimes. In particular, progress prose needs selection reading without a
   // permanent second toolbar. Dialogs must survive that visual choice.
   return Y.jsxs(Y.Fragment, {
-    children: [renderContent ? renderContent(controls) : controls,
+    children: [renderContent ? renderContent(controls, { busy, pickerOpen }) : controls,
       selectionOnly && busy ? Y.jsx("div", {
         role: "status", "data-codex-local-read-aloud": "selection-status",
         style: { position: "fixed", right: 24, bottom: 96, zIndex: 1000 },
-        children: Y.jsx("button", {
+        children: Y.jsxs(Dr, {
+          color: "ghost", size: "compact",
           type: "button", "aria-label": "Stop reading aloud", title: "Stop reading aloud (Esc)",
           "data-codex-local-read-aloud": "selection-stop",
-          className: "rounded-full border px-3 py-2 shadow-lg",
-          style: { background: "var(--color-token-main-surface-primary, Canvas)", color: "inherit" },
-          onClick: stopReading, children: "Stop reading aloud",
+          onClick: stopReading, children: [Y.jsx("svg", {
+            className: "icon-xs", viewBox: "0 0 24 24", fill: "currentColor", "aria-hidden": true,
+            children: Y.jsx("rect", { x: 6, y: 6, width: 12, height: 12, rx: 1 }),
+          }), "Stop"],
         }),
       }) : null, pickerOpen ? Y.jsx(CodexReadAloudVoicePicker, {
       bridge, speaker, onClose: closePicker,

@@ -10,8 +10,13 @@ function CodexVoiceReadGroup({ entry, latestTurnFooter, latestTurnFollowContentR
     if (candidates.length !== group.partIds.length) return [];
     const parts = group.partIds.map(id => candidates.find(part => part.getAttribute('data-codex-read-aloud-part') === id));
     if (parts.some(part => !part) || new Set(parts).size !== parts.length) return [];
-    if (parts.some(part => part.getAttribute('data-codex-read-aloud-part-state') !== 'complete')) return [];
-    const roots = parts.map(part => part.querySelector('[data-selected-text-overlay-target]'));
+    // Whole-answer completion and selection eligibility are different. A
+    // partial history page can still own several completed adjacent parts.
+    // Pending parts remain outside the readable set, so a range crossing
+    // their prose is rejected by the exact-selection coverage check.
+    const readableParts = parts.filter(part => part.getAttribute('data-codex-read-aloud-part-state') === 'complete');
+    if (group.completed && readableParts.length !== parts.length) return [];
+    const roots = readableParts.map(part => part.querySelector('[data-selected-text-overlay-target]'));
     return roots.some(part => !part) ? [] : roots;
   };
   const renderChild = (child, index) => {
@@ -34,10 +39,13 @@ function CodexVoiceReadGroup({ entry, latestTurnFooter, latestTurnFollowContentR
     ref: root, 'data-codex-read-aloud-group': entry.turnKey,
     children: [fA.jsx('div', { className: 'flex flex-col gap-6',
       children: group.children.map(renderChild) }),
-    group.completed && group.text.trim() ? fA.jsx('div', {
-      className: 'mt-1.5 flex min-h-5 items-center gap-0.5',
-      'data-codex-local-read-aloud': 'response-controls',
-      children: fA.jsx(CodexLocalReadAloudButton, { getRoot, getTextRoots, getText: () => group.text }),
-    }) : null],
+    fA.jsx(CodexLocalReadAloudButton, { getRoot, getTextRoots, getText: () => group.text,
+      selectionOnly: !group.completed,
+      renderContent: (controls, state = {}) => group.completed && group.text.trim() ? fA.jsx('div', {
+        className: 'mt-1.5 flex min-h-5 items-center gap-0.5',
+        'data-codex-read-aloud-active': state.busy || state.pickerOpen ? 'true' : undefined,
+        'data-codex-local-read-aloud': 'response-controls', children: controls,
+      }) : null,
+    })],
   });
 }

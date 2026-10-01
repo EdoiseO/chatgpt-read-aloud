@@ -16,6 +16,8 @@ process.stdin.on('end', () => {
   const compiler = { c(size) { const key = renderer + ':' + size; if (!caches.has(key)) caches.set(key, Array(size).fill(Symbol.for('react.memo_cache_sentinel'))); return caches.get(key); } };
   const react = { useRef(initial) { const key = renderer + ':ref:' + refIndex++; if (!refs.has(key)) refs.set(key, { current: initial }); return refs.get(key); }, useEffect() {}, useEffectEvent: identity };
   const atoms = { realtime: undefined, item: undefined, turn: undefined, compact: false };
+  const intl = { formatMessage: ({ defaultMessage }) => defaultMessage };
+  const analytics = { submitCodexAnalyticsEvent() {} };
   // Y is the JSX binding in the response module and the atom reader in the
   // voice-history module. A callable stub with JSX properties serves both
   // isolated functions without evaluating either module's imports.
@@ -24,10 +26,10 @@ process.stdin.on('end', () => {
   const ctx = {
     ix: compiler, px: compiler, Mk: compiler, Lk: compiler, sO: compiler, ax: react, mx: { Fragment: 'fragment' },
     Y, hx: { jsx, jsxs: jsx }, Nk: { jsx, jsxs: jsx }, Rk: { jsx, jsxs: jsx, Fragment: 'fragment' }, uO: { jsx, jsxs: jsx },
-    ci: () => ({ formatMessage: ({ defaultMessage }) => defaultMessage }),
+    ci: () => intl,
     d: () => ({ value: { routeKind: 'local-thread', routeTemplate: '/local' } }),
     ot: atom => atom === 'Nf' ? atoms.compact : false,
-    le: atom => atom === 'Wd' ? true : atom === '$t' ? { submitCodexAnalyticsEvent() {} } : false, yi: () => null,
+    le: atom => atom === 'Wd' ? true : atom === '$t' ? analytics : false, yi: () => null,
     J: (...values) => values.filter(Boolean).join(' '),
     yl: identity, yb: identity, Rh: identity, Mt: identity, Xa: identity,
     cc: identity, xd: identity, sr: identity, Gp: identity, Xs: identity, l: identity,
@@ -58,12 +60,12 @@ process.stdin.on('end', () => {
     for (const child of Array.isArray(children) ? children : [children]) nodes(child, type, result);
     return result;
   }
-  function response(props, key) {
+  function response(props, key, speechState = {}) {
     const controller = render('Vb', { conversationId: 'fixture', assistantCopyText: 'A completed sentence.',
       item: { type: 'assistant-message', content: 'A completed sentence.', completed: true, phase: null }, ...props }, key);
     assert.equal(controller.type, ctx.CodexLocalReadAloudButton, 'The controller stays mounted even while registration is disabled');
     assert.equal(typeof controller.props.renderContent, 'function');
-    const tree = controller.props.renderContent(controller.props.enabled ? jsx('SpeechPair', controller.props) : null);
+    const tree = controller.props.renderContent(controller.props.enabled ? jsx('SpeechPair', { ...controller.props, active: speechState.busy === true }) : null, speechState);
     const actions = nodes(tree, ctx.Xb);
     assert.ok(actions.length <= 1, 'A response must not mount duplicate native action rows');
     const action = actions[0], row = action ? render('Xb', action.props, key + '-row') : null;
@@ -79,7 +81,7 @@ process.stdin.on('end', () => {
   const ordinary = response({ after: jsx('edit-card', { children: 'Edited file' }) }, 'ordinary');
   assert.equal(speech(ordinary.tree).length, 1);
   assert.equal(speech(ordinary.row).length, 1);
-  assert.equal(ordinary.row.props.children[1].type, 'SpeechPair');
+  assert.equal(ordinary.row.props.children[0].props.children[1].type, 'SpeechPair');
   assert.equal(ordinary.controller.props.enabled, true);
   assert.equal(ordinary.controller.props.selectionOnly, false);
   assert.match(ordinary.row.props.children[0].props.className, /opacity-0/);
@@ -161,6 +163,23 @@ process.stdin.on('end', () => {
   // Xb is shared with host views beyond Vb. A copyable row without the explicit
   // completed-response routing must not acquire speech controls accidentally.
   assert.equal(speech(render('Xb', { copyText: 'Unrelated copyable content' }, 'unrelated')).length, 0);
+  // Reuse Xb's real compiler cache with stable native props. A newly rendered
+  // speech child must not be lost to the host's pre-existing memo dependencies.
+  const stableRowProps = { copyText: 'Memo fixture', sentAtMs: 1 };
+  let previousPair;
+  for (const active of [false, true, true, false]) {
+    const pair = jsx('SpeechPair', { active });
+    const row = render('Xb', { ...stableRowProps, readAloudControl: pair,
+      readAloudActive: active }, 'shared-row-memo');
+    assert.equal(speech(row)[0], pair, 'Speech state/labels must refresh without changing native actions');
+    assert.notEqual(speech(row)[0], previousPair);
+    assert.equal(/opacity-0/.test(row.props.children[0].props.className), !active);
+    previousPair = pair;
+  }
+  const speechOnlyRow = render('Xb', { readAloudControl: jsx('SpeechPair', {} ) }, 'speech-only-row');
+  assert.match(speechOnlyRow.props.children[0].props.className, /opacity-0/);
+  assert.equal(speech(speechOnlyRow).length, 1);
+
   // Historical events in the user's report are canonical transcriptSegment and
   // bemItemPromoted/inlineMarkdown entries, not the legacy fx transcript path.
   // Neutral content below reproduces their structure without private history.
@@ -248,8 +267,14 @@ process.stdin.on('end', () => {
     function button(name) { return element('button', { 'data-probe-control': name, 'aria-label': name }, [name]); }
     function dom(tree) {
       if (tree == null || typeof tree === 'boolean') return null;
+      if (Array.isArray(tree)) return element('fragment', {}, tree.map(dom).filter(value => value != null));
       if (typeof tree !== 'object') return String(tree);
-      if (tree.type === 'SpeechPair') return element('fragment', {}, [button('read'), button('voice')]);
+      if (tree.type === 'SpeechPair') {
+        const read = button('read');
+        read.attrs['aria-label'] = tree.props.active ? 'Stop reading aloud' : 'Read this response aloud';
+        read.attrs['aria-pressed'] = tree.props.active ? 'true' : 'false';
+        return element('fragment', {}, [read, button('voice')]);
+      }
       if (tree.type === 'ft') return button('copy');
       if (tree.type === 'Tg') return button('rating');
       if (tree.type === 'Dr') return button('fork');
@@ -266,12 +291,21 @@ process.stdin.on('end', () => {
       const children = tree.props?.children;
       return element(tag, attrs, (Array.isArray(children) ? children : [children]).map(dom).filter(value => value != null));
     }
-    const ordinaryLayout = response({ turnId: 'layout-turn', onFork() {},
+    const ordinaryLayoutProps = { turnId: 'layout-turn', onFork() {},
       item: { type: 'assistant-message', content: 'A completed sentence.', completed: true, phase: null, sentAtMs: 1 },
-      after: jsx('edit-card', { children: 'Edited fixture document' }) }, 'layout-ordinary');
+      after: jsx('edit-card', { children: 'Edited fixture document' }) };
+    const ordinaryLayout = response(ordinaryLayoutProps, 'layout-ordinary');
+    const activeLayout = response(ordinaryLayoutProps, 'layout-ordinary', { busy: true });
+    const pickerLayout = response(ordinaryLayoutProps, 'layout-ordinary', { pickerOpen: true });
+    const stoppedLayout = response(ordinaryLayoutProps, 'layout-ordinary', { busy: false });
+    // Xb's P also honors the native persistent/always-show action policy.
+    const persistentLayout = response({ ...ordinaryLayoutProps, persistentAdditionalActions: [jsx('span', { children: '' })] }, 'layout-persistent');
     const progressLayout = response({ showActionRow: false, item: progressItem, assistantCopyText: undefined }, 'layout-progress');
     const makeLayout = (result, id) => { const node = dom(result.tree); node.attrs['data-probe-response'] = id; return node; };
-    process.stdout.write(JSON.stringify({ ordinary: makeLayout(ordinaryLayout, 'ordinary'), progress: makeLayout(progressLayout, 'progress') }));
+    process.stdout.write(JSON.stringify({ ordinary: makeLayout(ordinaryLayout, 'ordinary'),
+      active: makeLayout(activeLayout, 'ordinary'), picker: makeLayout(pickerLayout, 'ordinary'),
+      stopped: makeLayout(stoppedLayout, 'ordinary'), persistent: makeLayout(persistentLayout, 'persistent'),
+      progress: makeLayout(progressLayout, 'progress') }));
     return;
   }
   process.stdout.write('Host renderer boundaries verified\n');

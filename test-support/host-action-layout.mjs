@@ -24,7 +24,11 @@ try {
       for (const child of value.children) element.append(node(child));
       return element;
     }
-    document.body.append(node(layouts.ordinary), node(layouts.progress));
+    window.installLayout = (layout, id) => {
+      const replacement = node(layout), previous = document.querySelector(`[data-probe-response="${id}"]`);
+      if (previous) previous.replaceWith(replacement); else document.body.append(replacement);
+    };
+    document.body.append(node(layouts.ordinary), node(layouts.progress), node(layouts.persistent));
   }, layouts);
   await page.mouse.move(890, 590);
   async function state(id) {
@@ -35,7 +39,7 @@ try {
         let opacity = 1;
         for (let parent = button; parent; parent = parent.parentElement) opacity *= Number(getComputedStyle(parent).opacity);
         const box = button.getBoundingClientRect();
-        controls[button.dataset.probeControl] = { x: box.x, y: box.y, centerY: box.y + box.height / 2, width: box.width, height: box.height, opacity };
+        controls[button.dataset.probeControl] = { x: box.x, y: box.y, centerY: box.y + box.height / 2, width: box.width, height: box.height, opacity, label: button.getAttribute('aria-label') };
       }
       return { controls, rows: root.querySelectorAll('[data-codex-local-read-aloud="response-controls"]').length };
     }, id);
@@ -43,22 +47,40 @@ try {
   const hidden = await state('ordinary');
   assert.equal(hidden.rows, 1);
   assert.deepEqual(Object.keys(hidden.controls).sort(), ['copy', 'fork', 'rating', 'read', 'time', 'voice']);
-  for (const name of ['read', 'voice']) assert.equal(hidden.controls[name].opacity, 1);
-  for (const name of ['copy', 'fork', 'rating', 'time']) assert.equal(hidden.controls[name].opacity, 0);
+  for (const [name, control] of Object.entries(hidden.controls)) assert.equal(control.opacity, 0, `${name} must hide together when idle and not hovered`);
   const centers = Object.values(hidden.controls).map(control => control.centerY);
   assert.ok(Math.max(...centers) - Math.min(...centers) <= 1, 'All controls must share one row center');
-  assert.equal(hidden.controls.read.x > hidden.controls.fork.x, true);
+  assert.equal(hidden.controls.read.x > hidden.controls.copy.x, true);
+  assert.equal(hidden.controls.voice.x < hidden.controls.rating.x, true);
   await page.hover('[data-probe-response="ordinary"]');
   const hovered = await state('ordinary');
   for (const control of Object.values(hovered.controls)) assert.equal(control.opacity, 1);
   assert.deepEqual(Object.values(hovered.controls).map(control => [control.x, control.y]),
     Object.values(hidden.controls).map(control => [control.x, control.y]), 'Hover must not shift controls');
   await page.mouse.move(890, 590);
+  for (const control of Object.values((await state('ordinary')).controls)) assert.equal(control.opacity, 0, 'Pointer leave must hide speech with native actions');
   await page.locator('[data-probe-response="ordinary"] [data-probe-control="read"]').focus();
   for (const control of Object.values((await state('ordinary')).controls)) assert.equal(control.opacity, 1);
+  await page.evaluate(() => document.activeElement.blur());
+  for (const control of Object.values((await state('ordinary')).controls)) assert.equal(control.opacity, 0, 'Keyboard focus leaving the row must restore the idle policy');
+  // These are rerenders of the same actual Xb instance, including its compiler
+  // cache, exported by the host probe. The browser uses original pinned CSS.
+  for (const layout of ['active', 'picker']) {
+    await page.evaluate(value => window.installLayout(value, 'ordinary'), layouts[layout]);
+    const showing = await state('ordinary');
+    for (const name of ['copy', 'read', 'voice', 'rating', 'fork']) assert.equal(showing.controls[name].opacity, 1,
+      `${name} stays reachable during ${layout} even after pointer and focus leave`);
+    if (layout === 'active') assert.equal(showing.controls.read.label, 'Stop reading aloud');
+  }
+  await page.evaluate(value => window.installLayout(value, 'ordinary'), layouts.stopped);
+  for (const control of Object.values((await state('ordinary')).controls)) assert.equal(control.opacity, 0, 'Stopping restores native idle hiding');
+  const persistent = await state('persistent');
+  for (const name of ['copy', 'read', 'voice', 'rating', 'fork']) assert.equal(persistent.controls[name].opacity, 1,
+    'Speech must preserve native always-show/persistent action policy');
   const progress = await state('progress');
   assert.equal(progress.rows, 0, 'Selection-readable commentary must not add a permanent row');
   assert.deepEqual(progress.controls, {});
+  await page.locator('[data-probe-response="ordinary"] [data-probe-control="voice"]').focus();
   // Constrained panes may wrap, but controls must stay inside their action row.
   // These use the same inert widgets, not the full native rating/action menus.
   for (const width of [320, 240]) {

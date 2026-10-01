@@ -145,6 +145,37 @@ class SpeechHostTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr[-4000:])
         self.assertIn('Host action layout verified in an offline browser', result.stdout)
 
+    @unittest.skipUnless(shutil.which('node'), 'Node is required for the group layout probe')
+    def test_group_footer_hover_focus_playback_and_native_child_visibility(self):
+        _functions, css = self.actual_host_inputs()
+        result = subprocess.run(['node', 'test-support/group-action-layout.mjs'],
+                                input=json.dumps({'css': css}), capture_output=True,
+                                text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr[-4000:])
+        self.assertIn('Group footer visibility verified in an offline browser', result.stdout)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is required for the stop control probe')
+    def test_selection_stop_uses_native_compact_ghost_button_style(self):
+        _functions, css = self.actual_host_inputs()
+        from build_copy import read_header, leaf
+        with Path('/Applications/ChatGPT.app/Contents/Resources/app.asar').open('rb') as stream:
+            tree, _raw, body = read_header(stream)
+            item = leaf(tree, 'webview/assets/app-shared-5d8e744d1fa1.js')
+            stream.seek(body + int(item['offset']))
+            source = stream.read(item['size']).decode()
+        self.assertEqual(hashlib.sha256(source.encode()).hexdigest(),
+                         'f7edf3bfe729e74f0e375732a956f4d428ce4baea920908ae0ab5e325e4196f6',
+                         'Reviewed native button component changed')
+        import re
+        button = source[source.index('function Dci('):source.index('var Oci,kci,o5,Aci,jci,Mci;')]
+        constants = {name: re.search(name + r'=(\{[^}]+\})', source).group(1)
+                     for name in ('Aci', 'jci', 'Mci', 'lci')}
+        result = subprocess.run(['node', 'test-support/selection-stop-style.mjs'],
+                                input=json.dumps({'css': css, 'button': button, 'constants': constants}),
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr[-4000:])
+        self.assertIn('Native selection Stop style verified', result.stdout)
+
     @unittest.skipUnless(shutil.which('node'), 'Node is required for the host voice grouping probe')
     def test_actual_canonical_projection_group_rendering_and_navigation(self):
         functions, _css = self.actual_host_inputs(include_groups=True)

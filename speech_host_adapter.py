@@ -7,7 +7,7 @@ import hashlib
 from pathlib import Path
 import re
 
-ADAPTER_VERSION = 5
+ADAPTER_VERSION = 6
 TOOLBAR_ASSET = 'webview/assets/sites-end-resource-ac1aa5fe0447.js'
 TOOLBAR_SHA256 = 'b812c93a6dc37c0d4069658d858a20f5430219ca916b65abdfde72a013a4a32b'
 VOICE_TIMELINE_ASSET = 'webview/assets/local-conversation-thread-b33b65c9da1e.js'
@@ -35,13 +35,13 @@ NATIVE_ACTION_PROPS = ('alwaysShowActions:W&&(V||(w?.length??0)>0),turnId:W?i:vo
                        'timestampHoverOnly:se,additionalActions:S,trailingActions:T,persistentAdditionalActions:w')
 NATIVE_ACTION_ROW = 'Je?(0,Y.jsx)(Xb,{' + NATIVE_ACTION_PROPS + '}):null'
 SHARED_ACTION_ROW = ('!Et&&Je?(0,Y.jsx)(Xb,{' + NATIVE_ACTION_PROPS +
-                     ',readAloudControl:W?codexReadAloudControl:null}):null')
+                     ',readAloudControl:W?codexReadAloudControl:null,readAloudActive:W&&(codexReadAloudState.busy||codexReadAloudState.pickerOpen)}):null')
 TOOLBAR_RETURN = ('let me;return t[44]!==M||t[45]!==ue||t[46]!==de||t[47]!==fe||t[48]!==pe?'
                   '(me=(0,Y.jsxs)(`div`,{ref:M,className:ue,children:[de,fe,pe]}),'
                   't[44]=M,t[45]=ue,t[46]=de,t[47]=fe,t[48]=pe,t[49]=me):me=t[49],me}')
 SHARED_TOOLBAR_RETURN = ('return(0,Y.jsxs)(`div`,{ref:M,className:ue,'
                          '"data-codex-local-read-aloud":codexReadAloudControl!=null?"response-controls":void 0,'
-                         'children:[de,codexReadAloudControl,fe,pe]})}')
+                         'children:[de,fe,pe]})}')
 # Keep this controller at a stable position even while completion changes.
 # A conditional div/controller switch would remount the response subtree. Its
 # render prop places only the button pair; picker/stop UI remains the controller's
@@ -50,7 +50,7 @@ VISIBLE_RESPONSE_RETURN = ('return(0,Y.jsx)(CodexLocalReadAloudButton,{'
                            'enabled:' + READ_ELIGIBILITY + ','
                            'selectionOnly:!(!Et&&Je&&W),'
                            'getText:()=>Sr(Ie()||n.content||``),getHtml:We,' + ROOT_ROUTING + ','
-                           'renderContent:codexReadAloudControl=>(0,Y.jsxs)(`div`,{'
+                           'renderContent:(codexReadAloudControl,codexReadAloudState={})=>(0,Y.jsxs)(`div`,{'
                            'ref:jt,...Nt,className:Pt,title:Ft,'
                            'children:[It,Lt,Bt,Vt,' + SHARED_ACTION_ROW + ']})})}')
 PATCHES = (
@@ -58,10 +58,25 @@ PATCHES = (
      'export{CodexLocalReadAloudButton};export{cv as $,wE as A,'),
     ('Move native actions beside speech', NATIVE_ACTION_ROW, 'null/* CODEX RESPONSE ACTIONS MOVED */'),
     ('Shared response toolbar prop', 'actionRowRef:M}=e,N=',
-     'actionRowRef:M,readAloudControl:codexReadAloudControl}=e,N='),
+     'actionRowRef:M,readAloudControl:codexReadAloudControl,readAloudActive:codexReadAloudActive}=e,N='),
+    # The host hides only its inner action group. Speech belongs inside that
+    # group, with the same hover/focus and always-show policy. A new memo slot
+    # prevents stale Read/Stop/selection labels when native props stay stable.
+    ('Shared action memo slot', 'function Xb(e){let t=(0,ix.c)(50),',
+     'function Xb(e){let t=(0,ix.c)(51),'),
+    ('Active speech keeps native actions reachable', 'P=a!==void 0&&a,',
+     'P=(a!==void 0&&a)||codexReadAloudActive===!0,'),
+    ('Speech-only actions use native visibility group', 'oe=re!=null||s!=null||c!=null||',
+     'oe=codexReadAloudControl!=null||re!=null||s!=null||c!=null||'),
+    ('Shared action memo dependency', 't[36]!==j||t[37]!==o?',
+     't[36]!==j||t[37]!==o||t[50]!==codexReadAloudControl?'),
+    ('Speech pair follows native copy', 't))}}),E,A,r===void 0?ae:',
+     't))}}),codexReadAloudControl,E,A,r===void 0?ae:'),
+    ('Shared action memo value', 't[37]=o,t[38]=de):de=t[38];',
+     't[37]=o,t[38]=de,t[50]=codexReadAloudControl):de=t[38];'),
     ('Speech keeps shared toolbar present', 'if(!(oe||O!=null||te&&b!=null))return null;',
      'if(!(oe||O!=null||te&&b!=null||codexReadAloudControl!=null))return null;'),
-    ('Persistent speech beside native controls', TOOLBAR_RETURN, SHARED_TOOLBAR_RETURN),
+    ('Native shared speech action row', TOOLBAR_RETURN, SHARED_TOOLBAR_RETURN),
     ('Visible completed-response speech slot', RESPONSE_RETURN, VISIBLE_RESPONSE_RETURN),
 )
 VOICE_TIMELINE_PATCHES = (

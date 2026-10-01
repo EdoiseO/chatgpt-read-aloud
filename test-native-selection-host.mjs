@@ -1,6 +1,6 @@
 // Actual pinned host J4e/G4e/q4e/c3e/i3e, patched in memory, on offline DOM.
-// Geometry, text serialization, React primitives, and the owner registry are
-// controlled dependencies. These tests do not launch or modify the desktop app.
+// Real host geometry runs in the browser; text serialization, React primitives,
+// and markdown rendering are controlled dependencies. These tests do not launch or modify the desktop app.
 import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -10,6 +10,8 @@ import { before, after, test } from 'node:test';
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE_PATH || 'playwright');
 const speechSource = ['speech-controller.mjs', 'kokoro-response-speaker.mjs', 'response-highlight.mjs', 'response-button.js']
+  .map(name => readFileSync(new URL(name, import.meta.url), 'utf8').replace(/^export /gm, '')).join('\n');
+const groupSource = ['voice-response-groups.mjs', 'voice-response-group-host.js']
   .map(name => readFileSync(new URL(name, import.meta.url), 'utf8').replace(/^export /gm, '')).join('\n');
 const host = JSON.parse(execFileSync('python3', ['-B', '-c', String.raw`
 import hashlib,json,os,re,struct
@@ -25,15 +27,17 @@ digest=hashlib.sha256(raw).hexdigest()
 if digest != HOST_SHA256: raise ValueError('Official selection fixture changed: '+digest)
 source=patch_selection_menu(raw.decode())
 functions=[]
-for name in ['codexReadAloudSelectionOwner','J4e','Y4e','X4e','G4e','q4e','c3e','i3e']:
+for name in ['codexReadAloudSelectionOwner','J4e','Y4e','X4e','G4e','q4e','c3e','i3e','K4e','Q4e','Z4e','FG','IG']:
     start=source.index('function '+name+'(')
     following=re.search(r'function [A-Za-z_$][\w$]*\(',source[start+9:])
     if following is None: raise ValueError('Cannot delimit '+name)
     function=source[start:start+9+following.start()]
     # The menu functions end immediately before their module's declarations.
-    function=function.split('var GG,KG,qG;')[0].split('var a3e,HG,UG;')[0]
+    function=function.split('var GG,KG,qG;')[0].split('var a3e,HG,UG;')[0].split('var LG;')[0]
     functions.append(function)
-print(json.dumps({'sha256':digest,'source':'\n'.join(functions)}))
+from test_speech_host_adapter import SpeechHostTests
+voice,_=SpeechHostTests().actual_host_inputs()
+print(json.dumps({'sha256':digest,'source':'\n'.join(functions),'voiceSource':voice['Ik']+voice['Ek']}))
 `], { cwd: new URL('.', import.meta.url), encoding: 'utf8' }));
 
 let browser;
@@ -45,10 +49,11 @@ async function fixture(markup, run, actualSpeech = false) {
   const page = await context.newPage();
   try {
     await page.setContent(markup);
-    await page.evaluate(({ source, speechSource }) => {
+    await page.evaluate(({ source, speechSource, groupSource, partialSetupSource, voiceSource }) => {
+      window.eval('window.partialResearchSetup=' + partialSetupSource);
       window.PG = node => node instanceof Element ? node : node?.parentElement;
       window.QNe = range => range.toString();
-      window.K4e = () => ({ rect: new DOMRect(10, 20, 30, 40) });
+      window.LG = new Set(['auto', 'clip', 'hidden', 'overlay', 'scroll']);
       window.bTe = 'data-selected-text-overlay-target';
       const cache = { c: size => Array(size).fill(Symbol.for('react.memo_cache_sentinel')) };
       window.GG = window.a3e = cache;
@@ -84,6 +89,7 @@ async function fixture(markup, run, actualSpeech = false) {
         resolve() { const selection = getSelection(); return h.J4e(selection, selection.getRangeAt(0), selector); },
         snapshot(container = document.body) { return h.G4e({ targetSelector: selector, targetContainer: container, windowZoom: 1 }); },
         menu(snapshot, nativeCallbacks = true) {
+          if (snapshot === null) return null;
           const callbacks = nativeCallbacks ? {
             onAddResponseTextAnnotation: (annotation, position, resume) => calls.push({ action: 'add', annotation }),
             onOpenQuickChat: (text, target) => calls.push({ action: 'details', text, target: target.id }),
@@ -124,6 +130,14 @@ async function fixture(markup, run, actualSpeech = false) {
           cancel: async () => ({ done: true }), onInterrupted: () => () => {},
         };
         window.eval(speechSource + '\nwindow.actualReadController=CodexLocalReadAloudButton;');
+        window.fA = window.Y; window.dA = { useRef: value => ({ current: value }) }; window.iA = 'voice-child';
+        window.CodexLocalReadAloudButton = window.actualReadController;
+        window.eval(groupSource + '\nwindow.actualVoiceReadGroup=CodexVoiceReadGroup;window.actualGroupVoiceResponses=codexGroupVoiceResponses;');
+        window.Y = Object.assign(() => undefined, window.Y); window.Lk = window.Mk = cache;
+        window.Rk = window.Nk = window.UG; window.wn = window.D = window.C = null;
+        window.Kv = 'assistant'; window.Uy = 'user'; window.Vy = 'speaker';
+        window.tm = (turn, part) => `${turn}:${part}`; window.kn = () => []; window.Dk = () => false;
+        window.eval(voiceSource + '\nwindow.actualVoiceTranscript=Ik;window.actualVoiceResearch=Ek;');
         Object.assign(window.fixture, {
           starts, alerts,
           mount(root, options = {}) {
@@ -132,10 +146,17 @@ async function fixture(markup, run, actualSpeech = false) {
             const cleanups = hooks.effects.map(callback => callback());
             return () => cleanups.forEach(cleanup => cleanup?.());
           },
+          mountGroup(root, entry) {
+            const tree = window.actualVoiceReadGroup({ entry });
+            tree.props.ref.current = root;
+            const controller = tree.props.children[1];
+            return controller ? { unmount: window.fixture.mount(root, controller.props), props: controller.props }
+              : { unmount() {}, props: { selectionOnly: true, renderContent: () => null } };
+          },
           async tick() { for (let index = 0; index < 12; index++) await Promise.resolve(); },
         });
       }
-    }, { source: host.source, speechSource: actualSpeech ? speechSource : null });
+    }, { source: host.source, speechSource: actualSpeech ? speechSource : null, groupSource, partialSetupSource, voiceSource: host.voiceSource });
     return await page.evaluate(run);
   } finally { await context.close(); }
 }
@@ -334,3 +355,139 @@ test('real native menu click rechecks registered ownership after the selected gr
   }, true);
   assert.deepEqual(value, { starts: [], alerts: [] });
 });
+
+
+// The screenshot crosses an Ik transcript and an Ek promoted markdown block.
+// Exercise their real group host + controller + native J4e popup pipeline while
+// the canonical page starts mid-answer. This previously lacked a group owner.
+const partialResearchMarkup = `<section id="voice-answer">
+  <div data-codex-read-aloud-part="transcript:intro" data-codex-read-aloud-part-state="complete"><div id="intro" data-selected-text-overlay-target="intro"><p>So, one thing to note from Sparkle: updates install a replacement app bundle.</p></div></div>
+  <div data-codex-local-read-aloud="group-auxiliary">Update compatibility research finished</div>
+  <div data-codex-read-aloud-part="presentation:research" data-codex-read-aloud-part-state="complete"><div id="research" data-selected-text-overlay-target="research"><h2>Research: keeping Read Aloud working through updates</h2><p>The right design is to check compatibility.</p><h3>What the research established</h3><p>Unselected following prose.</p></div></div>
+</section>`;
+
+async function partialResearchSetup() {
+  const f = fixture, root = document.querySelector('#voice-answer');
+  const intro = { id: 'intro', role: 'assistant', text: document.querySelector('#intro').textContent, completed: true };
+  const entries = [{ type: 'voice-transcript', conversationId: 'thread', hostId: 'host', turnKey: 'intro',
+    block: { canonical: true, type: 'tail', entries: [intro] } },
+    { type: 'voice-presentation', conversationId: 'thread', hostId: 'host', turnKey: 'research', presentation: {
+      type: 'inline-markdown', presentationId: 'research', content: document.querySelector('#research').textContent, completed: true } }];
+  const rt = item => ({ type: 'realtime', item: { realtimeSessionId: 'session', ...item } });
+  const timeline = { activeRealtimeSessionAtPageStart: 'session', entries: [rt({ type: 'transcriptSegment', ...intro }),
+    rt({ type: 'bemItemPromoted', id: 'research', presentation: { type: 'inlineMarkdown' } }), rt({ type: 'realtimeSessionClosed' })] };
+  const mode = root.dataset.mode;
+  if (mode === 'active work' || mode === 'unresolved research') {
+    entries.push(mode === 'active work' ? { turnKey: 'work', voiceWorkActivity: 'active' } :
+      { type: 'voice-presentation', turnKey: 'pending', presentation: { type: 'pending-artifact' } });
+    timeline.activeRealtimeSessionAtPageStart = null;
+    timeline.entries.unshift(rt({ type: 'realtimeSessionStarted' }));
+  } else if (mode === 'pending prose after selection') {
+    const pending = { id: 'pending', role: 'assistant', text: 'Unfinished following prose.', completed: false };
+    entries.push({ ...entries[0], turnKey: 'pending', block: { canonical: true, type: 'tail', entries: [pending] } });
+    timeline.entries.splice(-1, 0, rt({ type: 'transcriptSegment', ...pending }));
+  }
+  const entry = actualGroupVoiceResponses(entries, timeline)[0];
+  // Metadata comes from the actual pinned Ik/Ek wrappers, not hand-invented
+  // ownership markers. Native markdown contents are controlled fixture prose.
+  for (const child of entry.block.codexReadAloudGroup.children) {
+    if (child.type !== 'voice-transcript' && child.presentation?.type !== 'inline-markdown') continue;
+    const props = child.type === 'voice-transcript'
+      ? actualVoiceTranscript({ canonical: true, entry: child.block.entries[0], conversationId: 'thread' }).props
+      : actualVoiceResearch({ presentation: child.presentation, conversationId: 'thread' }).props;
+    const part = root.querySelector(`[data-codex-read-aloud-part="${props['data-codex-read-aloud-part']}"]`);
+    for (const [name, value] of Object.entries(props)) if (name.startsWith('data-') && value !== undefined) part.setAttribute(name, value);
+  }
+  f.mount(document.querySelector('#intro')); f.mount(document.querySelector('#research'));
+  const group = f.mountGroup(root, entry);
+  return { entry, group, root };
+}
+
+// Serialize the setup because browser fixtures run in isolated contexts.
+const partialSetupSource = partialResearchSetup.toString();
+
+test('partial canonical voice page offers Read aloud across transcript and research headings without an idle footer', async () => {
+  const value = await fixture(partialResearchMarkup, async () => {
+    const setup = await window.partialResearchSetup(), f = fixture;
+    const a = document.querySelector('#intro p').firstChild, b = document.querySelector('#research h3').firstChild;
+    f.select(a, 0, a, a.length);
+    const small = f.menu(f.snapshot()).labels;
+    const range = f.select(a, 0, b, b.length), native = range.toString(), visibleSelection = getSelection().toString();
+    const wideSnapshot = f.snapshot(), wide = f.menu(wideSnapshot);
+    wide?.click('Read aloud'); await f.tick();
+    return { completed: setup.entry.block.codexReadAloudGroup.completed, selectionOnly: setup.group.props.selectionOnly,
+      idleFooter: setup.group.props.renderContent('controls'), small, wide: wide?.labels ?? null, spoken: f.starts[0]?.text,
+      exactRange: wideSnapshot?.codexReadAloudRange.toString() === native, nativeUnchanged: getSelection().toString() === visibleSelection && getSelection().getRangeAt(0).startContainer === a && getSelection().getRangeAt(0).startOffset === 0 && getSelection().getRangeAt(0).endContainer === b && getSelection().getRangeAt(0).endOffset === b.length };
+  }, true);
+  assert.equal(value.completed, false); assert.equal(value.selectionOnly, true); assert.equal(value.idleFooter, null);
+  assert.deepEqual(value.small, ['Add to chat', 'More details', 'Ask in side chat', 'Read aloud']);
+  assert.deepEqual(value.wide, ['Read aloud']);
+  assert.equal(value.spoken, 'So, one thing to note from Sparkle: updates install a replacement app bundle.\n\nResearch: keeping Read Aloud working through updates\n\nThe right design is to check compatibility.\n\nWhat the research established');
+  assert.equal(value.exactRange, true); assert.equal(value.nativeUnchanged, true);
+});
+
+for (const mode of ['active work', 'unresolved research', 'pending prose after selection']) {
+  test(`completed neighboring passages remain selectable with ${mode}`, async () => {
+    const pending = '<div data-codex-read-aloud-part="transcript:pending"><div data-selected-text-overlay-target="pending">Unfinished following prose.</div></div>';
+    const markup = partialResearchMarkup.replace('<section id="voice-answer">', `<section id="voice-answer" data-mode="${mode}">`)
+      .replace('</section>', (mode === 'pending prose after selection' ? pending : '') + '</section>');
+    const value = await fixture(markup, async () => {
+      const setup = await window.partialResearchSetup(), f = fixture;
+      const a = document.querySelector('#intro p').firstChild, b = document.querySelector('#research h3').firstChild;
+      f.select(a, 0, b, b.length);
+      const menu = f.menu(f.snapshot(setup.root)); menu.click('Read aloud'); await f.tick();
+      return { completed: setup.entry.block.codexReadAloudGroup.completed, footer: setup.group.props.renderContent('controls'),
+        labels: menu.labels, spoken: f.starts[0]?.text };
+    }, true);
+    assert.equal(value.completed, false); assert.equal(value.footer, null); assert.deepEqual(value.labels, ['Read aloud']);
+    assert.match(value.spoken, /^So, one thing to note/); assert.match(value.spoken, /What the research established$/);
+    assert.ok(!value.spoken.includes('Unfinished'));
+  });
+}
+
+for (const failure of ['unowned prose', 'pending part', 'foreign owner', 'missing part']) {
+  test(`partial voice selection rejects ${failure} without falling back to clipped text`, async () => {
+    const value = await fixture(partialResearchMarkup.replace('<section id="voice-answer">', `<section id="voice-answer" data-failure="${failure}">`), async () => {
+      const setup = await window.partialResearchSetup(), f = fixture, failure = setup.root.dataset.failure;
+      const parts = setup.root.querySelectorAll('[data-codex-read-aloud-part]');
+      if (failure === 'unowned prose') {
+        const foreign = document.createElement('p'); foreign.textContent = 'A separate user answer.'; parts[0].after(foreign);
+      } else if (failure === 'pending part') parts[1].setAttribute('data-codex-read-aloud-part-state', 'pending');
+      else if (failure === 'foreign owner') parts[1].setAttribute('data-codex-read-aloud-owner', 'different-answer');
+      else parts[1].removeAttribute('data-codex-read-aloud-part');
+      f.select(document.querySelector('#intro p').firstChild, 0, document.querySelector('#research h3').firstChild, 8);
+      return { snapshot: f.snapshot(), starts: f.starts.length };
+    }, true);
+    assert.deepEqual(value, { snapshot: null, starts: 0 });
+  });
+}
+
+for (const mode of ['visible', 'partly-scrolled', 'wholly-offscreen', 'narrow-visible']) {
+  test(`real host selection geometry ${mode}`, async () => {
+    const markup = `<body data-mode="${mode}"><style>
+      #thread { width:680px; height:200px; overflow:auto; margin:20px }
+      #voice-answer { padding:5px } h2 { font-size:24px } h3 { font-size:20px }
+      </style><div id="thread"><div style="height:120px"></div>${partialResearchMarkup}
+      <div style="height:600px"></div></div>`;
+    const value = await fixture(markup, async () => {
+      const f = fixture;
+      await window.partialResearchSetup();
+      const thread = document.querySelector('#thread'), mode = document.body.dataset.mode;
+      if (mode === 'narrow-visible') { thread.style.width = '320px'; thread.style.height = '420px'; }
+      thread.scrollTop = mode === 'wholly-offscreen' ? 700 : mode === 'partly-scrolled' ? 170 : 70;
+      const a = document.querySelector('#intro p').firstChild, b = document.querySelector('#research h3').firstChild;
+      f.select(a, 0, b, b.length);
+      const snapshot = f.snapshot(thread), menu = snapshot ? f.menu(snapshot) : null;
+      if (menu) { menu.click('Read aloud'); await f.tick(); }
+      return { snapshot: snapshot !== null, labels: menu?.labels ?? [], spoken: f.starts[0]?.text,
+        rect: snapshot ? { top: snapshot.rect.top, bottom: snapshot.rect.bottom } : null,
+        bounds: { top: thread.getBoundingClientRect().top, bottom: thread.getBoundingClientRect().bottom } };
+    }, true);
+    if (mode === 'wholly-offscreen') assert.equal(value.snapshot, false);
+    else {
+      assert.equal(value.snapshot, true); assert.deepEqual(value.labels, ['Read aloud']);
+      assert.match(value.spoken, /Research: keeping Read Aloud/);
+      assert.ok(value.rect.top >= value.bounds.top && value.rect.bottom <= value.bounds.bottom);
+    }
+  });
+}

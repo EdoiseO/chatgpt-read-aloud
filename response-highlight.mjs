@@ -2,7 +2,13 @@
 // Callers provide the exact response element; no assistant-container selector
 // or native-selection mutation belongs in this module.
 export const RESPONSE_HIGHLIGHT_NAME = 'codex-read-aloud-active-sentence';
-export const RESPONSE_HIGHLIGHT_CSS = `::highlight(${RESPONSE_HIGHLIGHT_NAME}) { background-color: rgba(250, 204, 21, 0.34); color: inherit; }`;
+// Group footer visibility is scoped to its own answer. A generic Tailwind
+// `group` ancestor would also reveal unrelated native buttons in child cards.
+export const RESPONSE_HIGHLIGHT_CSS = `::highlight(${RESPONSE_HIGHLIGHT_NAME}) { background-color: rgba(250, 204, 21, 0.34); color: inherit; }
+[data-codex-read-aloud-group] > [data-codex-local-read-aloud="response-controls"] { opacity: 0; }
+[data-codex-read-aloud-group]:hover > [data-codex-local-read-aloud="response-controls"],
+[data-codex-read-aloud-group]:focus-within > [data-codex-local-read-aloud="response-controls"],
+[data-codex-read-aloud-group] > [data-codex-local-read-aloud="response-controls"][data-codex-read-aloud-active="true"] { opacity: 1; }`;
 
 const OMIT_TAGS = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT', 'BUTTON', 'INPUT', 'TEXTAREA', 'SELECT', 'OPTION', 'SVG', 'CANVAS']);
 const OMIT_ROLES = new Set(['toolbar', 'button', 'menu', 'menubar', 'menuitem', 'checkbox', 'radio', 'switch', 'slider', 'spinbutton', 'textbox', 'combobox']);

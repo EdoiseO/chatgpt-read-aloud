@@ -61,7 +61,10 @@ process.stdin.on('end', async () => {
     turnPresentationContexts: new Map(), turnsById: new Map([['turn', { ...turn, items: [] }]]) }]);
   const unresolved = call('codexGroupVoiceResponses', [missingProjection, timeline])[1];
   assert.equal(unresolved.block.codexReadAloudGroup.completed, false);
-  assert.equal(nodes(call('CodexVoiceReadGroup', [{ entry: unresolved }], 'missing-presentation'), 'Speech').length, 0);
+  const unresolvedControls = nodes(call('CodexVoiceReadGroup', [{ entry: unresolved }], 'missing-presentation'), 'Speech');
+  assert.equal(unresolvedControls.length, 1);
+  assert.equal(unresolvedControls[0].props.selectionOnly, true);
+  assert.equal(unresolvedControls[0].props.renderContent('controls'), null, 'An incomplete answer has selection registration but no idle footer');
   const grouped = call('codexGroupVoiceResponses', [projected, timeline]);
   assert.equal(grouped.length, 2);
   const response = grouped[1], group = response.block.codexReadAloudGroup;
@@ -149,6 +152,9 @@ process.stdin.on('end', async () => {
   assert.equal(call('actualLatestPhase', [response, null]).phase, 'idle');
   const live = { ...response, isInProgress: true, block: { ...response.block, codexReadAloudGroup: { ...group, completed: false } } };
   assert.equal(call('actualLatestPhase', [live, null]).phase, 'prework');
-  assert.equal(nodes(call('CodexVoiceReadGroup', [{ entry: live }]), 'Speech').length, 0);
+  const liveControls = nodes(call('CodexVoiceReadGroup', [{ entry: live }]), 'Speech');
+  assert.equal(liveControls.length, 1);
+  assert.equal(liveControls[0].props.selectionOnly, true);
+  assert.equal(liveControls[0].props.renderContent('controls'), null);
   process.stdout.write('Canonical grouped host routes verified\n');
 });
