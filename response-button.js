@@ -2,21 +2,63 @@
 let codexLocalResponseSpeaker;
 let codexReadAloudSelection = null;
 const codexReadAloudResponses = new Map();
-function codexRangeBelongsToResponse(root, range) {
+let codexSelectionRefreshQueued = false;
+function codexRefreshReadAloudSelection() {
+  const document = globalThis.document;
+  if (codexSelectionRefreshQueued || !document?.getSelection?.()?.rangeCount ||
+      typeof globalThis.Event !== "function") return;
+  codexSelectionRefreshQueued = true;
+  Promise.resolve().then(() => {
+    codexSelectionRefreshQueued = false;
+    if (document.getSelection()?.rangeCount) document.dispatchEvent(new globalThis.Event("selectionchange"));
+  });
+}
+function codexRangeIntersectsResponse(root, range) {
+  try {
+    return !!(root?.isConnected && range && !range.collapsed &&
+      (root.contains(range.startContainer) || root.contains(range.endContainer) || range.intersectsNode(root)));
+  } catch { return false; }
+}
+function codexSelectionBoundaryError() {
+  return Object.assign(new Error("Select text within one answer to read a passage."), { code: "CROSS_RESPONSE_SELECTION" });
+}
+function codexRangeBelongsToResponse(root, range, textRoots = null) {
+  if (textRoots !== null) {
+    try {
+      const parts = Array.from(textRoots);
+      if (!parts.length || !parts.every(part => part?.nodeType === 1 && root?.contains(part)) ||
+          !parts.some(part => part.contains(range?.startContainer)) ||
+          !parts.some(part => part.contains(range?.endContainer))) return false;
+    } catch { return false; }
+  }
   return !!(root?.isConnected && range && !range.collapsed
     && root.contains(range.startContainer) && root.contains(range.endContainer));
 }
 function codexFindSelectedResponse(root, range) {
   if (!codexRangeBelongsToResponse(root, range)) return null;
+  let found = null;
   for (const response of codexReadAloudResponses.values()) {
     const responseRoot = response.root();
-    if ((responseRoot === root || responseRoot?.contains(root)) && codexRangeBelongsToResponse(responseRoot, range)) return response;
+    if ((responseRoot === root || responseRoot?.contains(root)) &&
+        codexRangeBelongsToResponse(responseRoot, range) && response.canReadRange(range) &&
+        (!found || found.root()?.contains(responseRoot))) found = response;
   }
-  return null;
+  return found;
 }
+// Only registered assistant content can widen the host's single-target menu.
+// Prefer the smallest owner; adjacent answers never acquire a shared owner by
+// walking arbitrary DOM ancestors. Group owners supply explicit text roots.
+globalThis.codexResolveReadAloudSelection = range => {
+  let found = null;
+  for (const response of codexReadAloudResponses.values()) {
+    const root = response.root();
+    if (codexRangeBelongsToResponse(root, range) && response.canReadRange(range) &&
+        (!found || found.contains(root))) found = root;
+  }
+  return found ? { root: found } : null;
+};
 globalThis.codexCanReadSelectionAloud = (root, range) => {
-  const response = codexFindSelectedResponse(root, range);
-  return !!response?.canReadRange(range);
+  return !!codexFindSelectedResponse(root, range);
 };
 globalThis.codexReadSelectionAloud = (root, range) => {
   const response = codexFindSelectedResponse(root, range);
@@ -132,7 +174,8 @@ function codexValidVoiceSettings(settings) {
       (settings.engine === undefined || ["mlx", "onnx"].includes(settings.engine));
   } catch { return false; }
 }
-function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
+function CodexLocalReadAloudButton({ getText, getHtml, getRoot, getTextRoots,
+  enabled = true, renderContent, selectionOnly = false }) {
   const React = Fo();
   const [active, setActive] = React.useState(false);
   const [checking, setChecking] = React.useState(false);
@@ -145,44 +188,77 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
   const pendingRead = React.useRef(null);
   const capturedRead = React.useRef(null);
   const highlight = React.useRef(null);
+  const activeRead = React.useRef(null);
+  const activeObserver = React.useRef(null);
   const rootGetter = React.useRef(getRoot);
   rootGetter.current = getRoot;
+  const enabledNow = React.useRef(enabled);
+  enabledNow.current = enabled === true;
+  const textRootsGetter = React.useRef(getTextRoots);
+  textRootsGetter.current = getTextRoots;
+  const textRoots = () => textRootsGetter.current ? Array.from(textRootsGetter.current() ?? []) : null;
   if (token.current === null) token.current = Symbol("response-speaker");
   const speaker = codexGetReadAloudSpeaker();
   const bridge = globalThis.codexLocalReadAloud;
   React.useEffect(() => {
     mounted.current = true;
+    // An eligibility transition tears down the previous session. Its cleanup
+    // deliberately avoids state updates after unmount; reset UI on the next
+    // mounted lifecycle so a disabled root cannot retain a dialog or Stop.
+    setChecking(false); setPickerOpen(false); setNativeOffer(null);
     const unsubscribe = speaker.subscribe(token.current, value => {
       activeNow.current = value;
-      if (!value) { highlight.current?.dispose(); highlight.current = null; }
+      if (!value) {
+        highlight.current?.dispose(); highlight.current = null;
+        activeRead.current = null;
+        activeObserver.current?.disconnect(); activeObserver.current = null;
+      }
       if (mounted.current) setActive(value);
     });
-    codexReadAloudResponses.set(token.current, {
-      root: () => rootGetter.current?.(),
+    if (enabled) codexReadAloudResponses.set(token.current, {
+      root: () => enabledNow.current ? rootGetter.current?.() : null,
       readRange: range => beginRead(range, true),
       canReadRange: range => {
+        if (!enabledNow.current) return false;
         try { return !!captureResponseSelection(rootGetter.current?.(), {
           isCollapsed: range.collapsed, rangeCount: 1, getRangeAt: () => range,
-        })?.map.text.trim(); } catch { return false; }
+        }, { textRoots: textRoots() })?.map.text.trim(); } catch { return false; }
       },
     });
     const selectionChanged = () => {
       const selection = globalThis.document?.getSelection?.();
       const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
-      setSelectionPresent(codexRangeBelongsToResponse(rootGetter.current?.(), range));
+      try { setSelectionPresent(enabledNow.current && codexRangeBelongsToResponse(rootGetter.current?.(), range, textRoots())); }
+      catch { setSelectionPresent(false); }
+    };
+    const escape = event => {
+      if (event.key === "Escape" && (activeNow.current || codexReadAloudSelection?.owner === token.current)) {
+        stopReading();
+      }
     };
     globalThis.document?.addEventListener?.("selectionchange", selectionChanged);
+    globalThis.document?.addEventListener?.("keydown", escape);
     selectionChanged();
     return () => {
       mounted.current = false;
       codexReadAloudResponses.delete(token.current);
+      codexRefreshReadAloudSelection();
       globalThis.document?.removeEventListener?.("selectionchange", selectionChanged);
+      globalThis.document?.removeEventListener?.("keydown", escape);
       highlight.current?.dispose(); highlight.current = null;
+      activeObserver.current?.disconnect(); activeObserver.current = null; activeRead.current = null;
       capturedRead.current = null; pendingRead.current = null;
       unsubscribe();
       if (codexReadAloudSelection?.owner === token.current) codexCancelReadAloudSelection();
     };
-  }, [speaker]);
+  }, [speaker, enabled]);
+  // Group membership is a rendering prop. Recheck after each commit rather
+  // than waiting for another audio progress event (which may be deduplicated).
+  React.useEffect(() => {
+    const read = activeRead.current;
+    if (read?.isCurrent && (!read.isCurrent() || !read.map.isCurrent())) speaker.stop();
+    codexRefreshReadAloudSelection();
+  });
 
   function closePicker() {
     if (codexReadAloudSelection?.owner === token.current) codexCancelReadAloudSelection();
@@ -190,22 +266,44 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
     if (mounted.current) setPickerOpen(false);
   }
 
+  function stopReading(event) {
+    event?.stopPropagation?.();
+    if (codexReadAloudSelection?.owner === token.current) codexCancelReadAloudSelection();
+    pendingRead.current = null;
+    capturedRead.current = null;
+    if (activeNow.current) speaker.stop();
+    if (mounted.current) { setChecking(false); setPickerOpen(false); setNativeOffer(null); }
+  }
+
   function prepareRead(range = null) {
+    if (!enabledNow.current) return null;
     const root = rootGetter.current?.();
     if (root?.isConnected) {
+      const parts = textRoots();
       const selection = range ? { isCollapsed: range.collapsed, rangeCount: 1, getRangeAt: () => range }
         : globalThis.document?.getSelection?.();
       const selectedRange = selection?.rangeCount === 1 ? selection.getRangeAt(0) : null;
-      const ownedSelection = codexRangeBelongsToResponse(root, selectedRange);
+      const ownedSelection = codexRangeBelongsToResponse(root, selectedRange, parts);
       if (range && !ownedSelection) throw new Error("The selected passage is no longer available.");
-      const selected = ownedSelection ? captureResponseSelection(root, selection) : null;
+      if (!ownedSelection && codexRangeIntersectsResponse(root, selectedRange)) throw codexSelectionBoundaryError();
+      const selected = ownedSelection ? captureResponseSelection(root, selection, { textRoots: parts }) : null;
       // An owned selection containing only omitted code stays an empty read;
       // it must not become a request for the whole response.
       if (ownedSelection && !selected) return null;
-      const map = selected ? selected.map : buildResponseTextMap(root);
+      const map = selected ? selected.map : buildResponseTextMap(root, { textRoots: parts });
       if (!map.text.trim()) return null;
-      return { text: map.text, map, sentenceRanges: map.sentenceSpans() };
+      const read = { text: map.text, map, sentenceRanges: map.sentenceSpans() };
+      read.isCurrent = () => {
+          try {
+            const current = textRoots();
+            return enabledNow.current && rootGetter.current?.() === root && root.isConnected &&
+              (parts === null ? current === null : current !== null &&
+              current.length === parts.length && current.every((part, index) => part === parts[index] && root.contains(part)));
+          } catch { return false; }
+      };
+      return read;
     }
+    if (textRootsGetter.current) throw new Error("The grouped response is no longer available.");
     if (range) throw new Error("The selected response is no longer available.");
     const html = getHtml?.();
     const text = String(codexReadableResponseText(html, html ? "" : getText()) ?? "").trim();
@@ -213,16 +311,39 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
   }
 
   function startRead(read, mode = "kokoro") {
+    if (!enabledNow.current || !mounted.current) return;
+    if (read.isCurrent && (!read.isCurrent() || !read.map.isCurrent())) {
+      globalThis.alert("The response changed. Please read it again.");
+      return;
+    }
     highlight.current?.dispose(); highlight.current = null;
     const nextHighlight = mode !== "native" && read.map ? createResponseHighlighter(read.map) : null;
     try {
       const options = mode === "native" ? {
         mode: "native", ...(read.map ? { sentenceRanges: read.sentenceRanges } : {}),
       } : read.map ? {
-        sentenceRanges: read.sentenceRanges, onProgress: progress => nextHighlight.onProgress(progress),
+        sentenceRanges: read.sentenceRanges, onProgress: progress => {
+          if (progress && read.isCurrent && !read.isCurrent()) {
+            nextHighlight.dispose(); speaker.stop(); return;
+          }
+          nextHighlight.onProgress(progress);
+        },
       } : undefined;
       speaker.toggle(token.current, read.text, options);
-      if (mounted.current && activeNow.current) highlight.current = nextHighlight;
+      if (mounted.current && activeNow.current) {
+        highlight.current = nextHighlight;
+        activeRead.current = read;
+        if (read.isCurrent && typeof globalThis.MutationObserver === "function") {
+          const observer = new globalThis.MutationObserver(() => {
+            if (activeRead.current === read && (!read.isCurrent() || !read.map.isCurrent())) speaker.stop();
+          });
+          observer.observe(read.map.root, { childList: true, characterData: true, subtree: true,
+            attributes: true, attributeFilter: ['data-markdown-copy', 'data-codex-read-aloud-part',
+              'data-codex-read-aloud-owner', 'data-codex-read-aloud-part-state',
+              'data-codex-local-read-aloud', 'role', 'aria-hidden', 'hidden', 'inert', 'class', 'style'] });
+          activeObserver.current = observer;
+        }
+      }
       else nextHighlight?.dispose();
     } catch {
       nextHighlight?.dispose();
@@ -231,6 +352,7 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
   }
 
   async function beginRead(range = null, restart = false, captured = null) {
+    if (!enabledNow.current) return;
     if (!restart && (activeNow.current || codexReadAloudSelection?.owner === token.current)) {
       if (codexReadAloudSelection?.owner === token.current) codexCancelReadAloudSelection();
       speaker.stop();
@@ -239,9 +361,20 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
     codexCancelReadAloudSelection();
     speaker.stop();
     let read;
-    try { read = captured ? captured.read : prepareRead(range); }
-    catch { globalThis.alert("Could not read this response. Please try again."); return; }
+    try {
+      if (captured?.error) throw captured.error;
+      read = captured ? captured.read : prepareRead(range);
+    }
+    catch (error) {
+      globalThis.alert(error?.code === "CROSS_RESPONSE_SELECTION"
+        ? "Select text within one answer to read a passage." : "Could not read this response. Please try again.");
+      return;
+    }
     if (!read) return;
+    if (read.isCurrent && (!read.isCurrent() || !read.map.isCurrent())) {
+      globalThis.alert("The response changed. Please read it again.");
+      return;
+    }
     const selection = {
       owner: token.current,
       cancel() {
@@ -300,7 +433,13 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
     if (event.button && event.button !== 0) return;
     const selection = globalThis.document?.getSelection?.();
     const root = rootGetter.current?.();
-    if (!selection?.rangeCount || !codexRangeBelongsToResponse(root, selection.getRangeAt(0))) {
+    let owned = false;
+    try { owned = selection?.rangeCount && codexRangeBelongsToResponse(root, selection.getRangeAt(0), textRoots()); }
+    catch { /* A stale group cannot capture a broader selection. */ }
+    if (!owned) {
+      if (codexRangeIntersectsResponse(root, selection?.rangeCount ? selection.getRangeAt(0) : null)) {
+        capturedRead.current = { error: codexSelectionBoundaryError() };
+      }
       if (event.type === "mousedown" && capturedRead.current) event.preventDefault();
       return;
     }
@@ -365,8 +504,23 @@ function CodexLocalReadAloudButton({ getText, getHtml, getRoot }) {
       }),
     }),
   });
+  const controls = enabled ? Y.jsxs(Y.Fragment, { children: [readButton, voiceButton] }) : null;
+  // Rendering text, registering speech, and placing controls have independent
+  // lifetimes. In particular, progress prose needs selection reading without a
+  // permanent second toolbar. Dialogs must survive that visual choice.
   return Y.jsxs(Y.Fragment, {
-    children: [readButton, voiceButton, pickerOpen ? Y.jsx(CodexReadAloudVoicePicker, {
+    children: [renderContent ? renderContent(controls) : controls,
+      selectionOnly && busy ? Y.jsx("div", {
+        role: "status", "data-codex-local-read-aloud": "selection-status",
+        style: { position: "fixed", right: 24, bottom: 96, zIndex: 1000 },
+        children: Y.jsx("button", {
+          type: "button", "aria-label": "Stop reading aloud", title: "Stop reading aloud (Esc)",
+          "data-codex-local-read-aloud": "selection-stop",
+          className: "rounded-full border px-3 py-2 shadow-lg",
+          style: { background: "var(--color-token-main-surface-primary, Canvas)", color: "inherit" },
+          onClick: stopReading, children: "Stop reading aloud",
+        }),
+      }) : null, pickerOpen ? Y.jsx(CodexReadAloudVoicePicker, {
       bridge, speaker, onClose: closePicker,
       onChosen: () => {
         const read = pendingRead.current;

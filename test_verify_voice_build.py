@@ -18,6 +18,8 @@ import zipfile
 import asar_integrity
 import configure_launcher as launcher
 import verify_voice_build as verify
+import speech_host_adapter as speech_host
+import selection_host_adapter as selection_host
 from updater_host_gate import HOST_GATE_ASSETS, HOST_GATE_ANCHORS
 
 
@@ -62,6 +64,8 @@ def fixture():
             'kokoro-main.cjs': '/* sandbox-exec (deny network*) */',
             'kokoro_worker.py': '# fixture worker never executed\n',
         }
+        for name in ('voice-response-groups.mjs', 'voice-response-group-host.js'):
+            contents[name] = (verify.ROOT / name).read_text()
         for name, content in contents.items():
             (source / name).write_text(content)
         runtime = home / 'Library/Application Support/ChatGPT Read Aloud/kokoro'
@@ -81,10 +85,25 @@ def fixture():
         settings = runtime / 'settings.json'
         settings.write_text(json.dumps({'version': 1, 'selectedVoice': 'af_aoede'}))
         settings.chmod(0o600)
-        asset = '\n'.join(contents[name].replace('export ', '') for name in contents if name.endswith(('.js', '.mjs')))
-        asset += '\ngetReadAloudRoot:()=>ye.current?.querySelector(`[data-selected-text-overlay-target]`)'
+        payload = '\n'.join(contents[name].replace('export ', '') for name in
+                            ('response-button.js', 'voice-picker.js', 'speech-controller.mjs',
+                             'kokoro-response-speaker.mjs', 'response-highlight.mjs'))
+        toolbar = '\n'.join(before for _label, before, _after in speech_host.PATCHES) + '\nexport{}'
+        toolbar_hash = hashlib.sha256(toolbar.encode()).hexdigest()
+        with patch.object(speech_host, 'TOOLBAR_SHA256', toolbar_hash):
+            asset = speech_host.append_payload(speech_host.patch_toolbar(toolbar), payload)
+        timeline = '\n'.join(before for _label, before, _after in speech_host.VOICE_TIMELINE_PATCHES) + '\nexport{}'
+        timeline_hash = hashlib.sha256(timeline.encode()).hexdigest()
+        with patch.object(speech_host, 'VOICE_TIMELINE_SHA256', timeline_hash):
+            patched_timeline = speech_host.patch_voice_timeline(timeline)
+        selection = '\n'.join(before for before, _after, _label in
+                              selection_host._HOST_REPLACEMENTS + selection_host._MENU_REPLACEMENTS)
+        selection_hash = hashlib.sha256(selection.encode()).hexdigest()
+        with patch.object(selection_host, 'HOST_SHA256', selection_hash):
+            patched_selection = selection_host.patch_selection_menu(selection)
         files = {verify.ASSET: asset.encode(),
-                 verify.SELECTION_ASSET: (verify.SELECTION_BUTTON + '\nreadAloudRoot:u,readAloudRange:l').encode(),
+                 verify.VOICE_TIMELINE_ASSET: patched_timeline.encode(),
+                 verify.SELECTION_ASSET: patched_selection.encode(),
                  verify.EARLY: b'require("./local-read-aloud-main.cjs");',
                  verify.PRELOAD: b'exposeInMainWorld("codexLocalReadAloud" /* sentenceRanges */',
                  verify.MAIN: contents['kokoro-main.cjs'].encode()}
@@ -97,6 +116,7 @@ def fixture():
                 'CFBundleShortVersionString': verify.VERSION, 'CodexReadAloudVoicePickerVersion': 1,
                 'CodexReadAloudSelectionHighlightVersion': 1, 'CodexReadAloudSkipCodeBlocksVersion': 1,
                 'CodexReadAloudLauncherVersion': 3, 'CodexReadAloudUpdaterPolicyVersion': 2,
+                'CodexReadAloudSpeechHostAdapterVersion': speech_host.ADAPTER_VERSION,
                 'SUEnableAutomaticChecks': False, 'SUAutomaticallyUpdate': False,
                 'SUAllowsAutomaticUpdates': False, 'ElectronAsarIntegrity': integrity,
                 'LSEnvironment': {'CODEX_ELECTRON_USER_DATA_PATH': str(runtime.parent / 'user-data'),
@@ -115,10 +135,15 @@ def fixture():
             commands.append(list(arguments))
             return SimpleNamespace(returncode=0, stdout='0\n' if arguments[0] == '/usr/bin/defaults' else '', stderr='')
         with patch.dict(HOST_GATE_ASSETS, {key: hashlib.sha256(value).hexdigest()
-                                          for key, value in gate_files.items()}, clear=True):
+                                          for key, value in gate_files.items()}, clear=True), \
+                patch.object(speech_host, 'TOOLBAR_SHA256', toolbar_hash), \
+                patch.object(speech_host, 'VOICE_TIMELINE_SHA256', timeline_hash), \
+                patch.object(selection_host, 'HOST_SHA256', selection_hash):
             yield SimpleNamespace(root=root, app=app, home=home, source=source, runtime=runtime,
                                   archive=archive, info=info, info_path=info_path, files=files,
-                                  header_hash=header_hash, framework=framework, runner=runner, commands=commands)
+                                  header_hash=header_hash, framework=framework, runner=runner, commands=commands,
+                                  ui_hashes={'toolbar': toolbar_hash, 'timeline': timeline_hash,
+                                             'selection': selection_hash})
 
 
 def check(data, **kwargs):
@@ -135,7 +160,17 @@ class VerifierTests(unittest.TestCase):
             self.assertTrue(report['voiceChoiceInformational'])
             self.assertEqual(report['voiceChoice'], 'af_aoede')
             self.assertEqual(report['availableVoiceCount'], 2)
-            self.assertEqual(report['packedAssetsVerified'], 7)
+            self.assertEqual(report['packedAssetsVerified'], 8)
+            self.assertTrue(report['staticUIAdapterVerified'])
+            self.assertEqual(report['speechHostAdapter']['adapterVersion'], speech_host.ADAPTER_VERSION)
+            self.assertTrue(report['speechHostAdapter']['selectionIndependentOfNativeActions'])
+            self.assertTrue(report['speechHostAdapter']['voiceTimeline']['canonicalVoiceResponseGrouping'])
+            self.assertTrue(report['selectionHostAdapter']['exactSelectionRouting'])
+            self.assertEqual(report['selectionHostAdapter']['hostSelectionSha256'], data.ui_hashes['selection'])
+            self.assertFalse(report['desktopBehaviorVerified'])
+            self.assertFalse(report['manualAudioVerified'])
+            self.assertIn('static pinned', report['integrationVerification'])
+            self.assertNotIn('manualUpdateCheckVerified', report)
             self.assertTrue(report['updaterPolicy']['hostUpdaterDisabled'])
             self.assertTrue(report['updaterPolicy']['manualUpdatesBlocked'])
             self.assertEqual(check(data, scope='installed')['activation'], 'installed')
@@ -221,9 +256,12 @@ class VerifierTests(unittest.TestCase):
     def test_corruption_fails_with_normal_optimized_and_environment_optimized_python(self):
         code = ('from pathlib import Path; import sys,json; import verify_voice_build as v; '
                 'import updater_host_gate as g; g.HOST_GATE_ASSETS.update(json.loads(sys.argv[4])); '
+                'import speech_host_adapter as h, selection_host_adapter as s; pins=json.loads(sys.argv[5]); '
+                'h.TOOLBAR_SHA256=pins["toolbar"]; h.VOICE_TIMELINE_SHA256=pins["timeline"]; s.HOST_SHA256=pins["selection"]; '
                 'v.verify_build(Path(sys.argv[1]),home=Path(sys.argv[2]),source_root=Path(sys.argv[3]),'
                 'runner=lambda *a,**k:None)')
-        for mutation in ('valid', 'identity', 'marker', 'header', 'truncated', 'block_size', 'stale_worker', 'voice'):
+        for mutation in ('valid', 'identity', 'marker', 'header', 'truncated', 'block_size', 'stale_worker', 'voice',
+                         'ui_marker', 'toolbar_host', 'timeline_host', 'selection_host', 'stale_group'):
             with self.subTest(mutation=mutation), fixture() as data:
                 if mutation == 'identity':
                     data.info['CFBundleIdentifier'] = 'wrong'
@@ -245,6 +283,18 @@ class VerifierTests(unittest.TestCase):
                     (data.runtime / verify.WORKER_NAME).write_text('# stale worker')
                 elif mutation == 'voice':
                     (data.runtime / 'settings.json').write_text(json.dumps({'version': 1, 'selectedVoice': 'af_invented'}))
+                elif mutation == 'ui_marker':
+                    data.info['CodexReadAloudSpeechHostAdapterVersion'] = speech_host.ADAPTER_VERSION - 1
+                elif mutation in ('toolbar_host', 'timeline_host', 'selection_host'):
+                    key = {'toolbar_host': verify.ASSET, 'timeline_host': verify.VOICE_TIMELINE_ASSET,
+                           'selection_host': verify.SELECTION_ASSET}[mutation]
+                    data.files[key] += b'\n/* unreviewed host change */'
+                    digest = write_archive(data.archive, data.files)
+                    data.info['ElectronAsarIntegrity']['Resources/app.asar']['hash'] = digest
+                    data.framework.write_bytes(asar_integrity.SENTINEL + b'\x01\x01' +
+                        asar_integrity.integrity_dictionary_digest(data.info['ElectronAsarIntegrity']))
+                elif mutation == 'stale_group':
+                    (data.source / 'voice-response-group-host.js').write_text('/* newer grouping UI */')
                 data.info_path.write_bytes(plistlib.dumps(data.info))
                 for flag, optimized in (([], None), (['-O'], None), ([], '1')):
                     environment = dict(os.environ)
@@ -252,7 +302,7 @@ class VerifierTests(unittest.TestCase):
                     if optimized:
                         environment['PYTHONOPTIMIZE'] = optimized
                     result = subprocess.run([sys.executable, *flag, '-c', code, str(data.app), str(data.home),
-                                             str(data.source), json.dumps(HOST_GATE_ASSETS)],
+                                             str(data.source), json.dumps(HOST_GATE_ASSETS), json.dumps(data.ui_hashes)],
                                             cwd=verify.ROOT, env=environment, capture_output=True, text=True, timeout=5)
                     if mutation == 'valid':
                         self.assertEqual(result.returncode, 0, result.stderr)

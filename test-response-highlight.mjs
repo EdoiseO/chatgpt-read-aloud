@@ -30,6 +30,34 @@ async function documentTest(markup, run) {
   } finally { await context.close(); }
 }
 
+test('explicit assistant roots preserve prose/table ranges without reading surrounding timeline content', async () => {
+  const value = await documentTest('<section id="group"><p id="a">Opening.</p><div>Research finished.</div><p>User turn.</p><div id="b"><table><tr><td>Plan</td><td>Ready</td></tr></table><pre>secret_code()</pre></div><p id="c">Closing.</p></section><p id="foreign">Other response.</p>', () => {
+    const root = document.querySelector('#group'), parts = ['a', 'b', 'c'].map(id => document.getElementById(id));
+    // Input root order and duplicate nested entries cannot reorder/duplicate speech.
+    const map = window.helpers.buildResponseTextMap(root, { textRoots: [parts[2], parts[0], parts[1], parts[1].querySelector('td')] });
+    const pieces = map.rangesForOffsets(0, map.text.length).map(range => range.toString());
+    const broadRange = map.rangeForOffsets(0, map.text.length);
+    const empty = window.helpers.buildResponseTextMap(root, { textRoots: [] }).text;
+    const foreign = window.helpers.buildResponseTextMap(root, { textRoots: [parts[0], document.querySelector('#foreign')] }).text;
+    parts[0].remove();
+    return { text: map.text, pieces, broadRange: broadRange?.toString() ?? null, empty, foreign, stale: map.rangesForOffsets(0, 8).length };
+  });
+  assert.deepEqual(value, { text: 'Opening.\n\nPlan Ready\n\nClosing.', pieces: ['Opening.', 'Plan', 'Ready', 'Closing.'], broadRange: null, empty: '', foreign: '', stale: 0 });
+});
+
+test('grouped selection must begin and end in assistant text and excludes intervening status', async () => {
+  const value = await documentTest('<section id="group"><p id="a">Alpha.</p><p id="work" data-codex-local-read-aloud="group-auxiliary">Working.</p><p id="b">Bravo.</p></section>', () => {
+    const root = document.querySelector('#group'), a = root.querySelector('#a'), b = root.querySelector('#b'), work = root.querySelector('#work');
+    const range = document.createRange(); range.setStart(a.firstChild, 1); range.setEnd(b.firstChild, 4);
+    const selection = { rangeCount: 1, isCollapsed: false, getRangeAt: () => range };
+    const selected = window.helpers.captureResponseSelection(root, selection, { textRoots: [a, b] });
+    range.setEnd(work.firstChild, 3);
+    const statusEndpoint = window.helpers.captureResponseSelection(root, selection, { textRoots: [a, b] });
+    return { text: selected.text, pieces: selected.map.rangesForOffsets(0, selected.text.length).map(range => range.toString()), statusEndpoint };
+  });
+  assert.deepEqual(value, { text: 'lpha.\n\nBrav', pieces: ['lpha.', 'Brav'], statusEndpoint: null });
+});
+
 test('visible prose, link labels, lists and BRs remain readable while code blocks are skipped', async () => {
   const value = await documentTest(`<section id="response">
     <p> First <strong>bold</strong> <a href="https://example.invalid/not-spoken">link label</a>.</p>

@@ -55,10 +55,11 @@ function fixture() {
       if (!(index in hooks.slots)) hooks.slots[index] = `test-id-${index}`;
       return hooks.slots[index];
     },
-    useEffect(callback) {
+    useEffect(callback, deps) {
       const index = hooks.index++;
-      if (!hooks.effects.has(index)) {
-        hooks.effects.set(index, callback);
+      const previous = hooks.effects.get(index);
+      if (!previous || deps === undefined || deps.length !== previous.deps?.length || deps.some((dep, i) => !Object.is(dep, previous.deps[i]))) {
+        hooks.effects.set(index, { callback, deps });
         hooks.toMount.push(index);
       }
     },
@@ -93,7 +94,10 @@ function fixture() {
             focus() { document.activeElement = this; }, querySelectorAll() { return []; },
           };
         });
-        for (const index of state.toMount.splice(0)) state.cleanups.set(index, state.effects.get(index)());
+        for (const index of state.toMount.splice(0)) {
+          state.cleanups.get(index)?.();
+          state.cleanups.set(index, state.effects.get(index).callback());
+        }
         return tree;
       },
       unmount() { for (const cleanup of state.cleanups.values()) cleanup?.(); },
@@ -133,6 +137,34 @@ function hasNativeOffer(tree) {
   walk(tree, node => { if (node.props?.['data-codex-local-read-aloud'] === 'native-status') found = true; });
   return found;
 }
+
+test('selection-only rendering keeps voice choice and fallback dialogs outside the suppressed pair', async () => {
+  for (const unavailable of [false, true]) {
+    const f = fixture();
+    let controls;
+    const response = f.mount('CodexLocalReadAloudButton', {
+      getText: () => 'Only the selected progress passage.', selectionOnly: true,
+      renderContent(pair) { controls = pair; return { type: 'article', props: { children: 'Progress text' } }; },
+    });
+    const idle = response.render();
+    let idlePairs = 0;
+    walk(idle, node => { if (node.props?.['data-codex-local-read-aloud'] === 'response') idlePairs++; });
+    assert.equal(idlePairs, 0);
+    // Exercise the controller command; native-host composition is covered by
+    // test-native-selection-host.mjs using an actual selected DOM range.
+    const pending = read(controls).props.onClick(event());
+    if (unavailable) f.jobs[0].reject(new Error('Local read-aloud is unavailable.'));
+    else f.jobs[0].resolve({ selectedVoice: null });
+    await pending;
+    const tree = response.render();
+    if (unavailable) button(tree, 'Use Mac voice').props.onClick(event());
+    else picker(tree).props.onChosen({ selectedVoice: 'af_aoede' });
+    assert.equal(f.toggles.length, 1);
+    assert.equal(f.toggles[0].text, 'Only the selected progress passage.');
+    assert.equal(f.alerts.length, 0);
+    response.unmount();
+  }
+});
 
 test('helper lookup failure offers Mac speech only after explicit choice, preserves the read and never saves a voice', async () => {
   const f = fixture(), response = f.response('Only the held passage.');

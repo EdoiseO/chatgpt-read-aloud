@@ -12,6 +12,9 @@ import subprocess
 
 from asar_integrity import patch_integrity_slot, rewrite_embedded_integrity
 from updater_host_gate import HOST_GATE_ASSETS, validate_host_gate_assets
+from speech_host_adapter import (ADAPTER_VERSION, VOICE_TIMELINE_ASSET,
+                                 patch_toolbar, patch_voice_timeline, append_payload)
+from selection_host_adapter import SELECTION_BUTTON, patch_selection_menu
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = Path('/Applications/ChatGPT.app')
@@ -21,8 +24,6 @@ FRAMEWORK = Path('Contents/Frameworks/Codex Framework.framework/Versions/Current
 ASSET = 'webview/assets/sites-end-resource-ac1aa5fe0447.js'
 SELECTION_ASSET = 'webview/assets/app-primary-92c16ff2fe4e.js'
 VERSION = '26.928.20755'
-ANCHOR = '}}),E,A,r===void 0?ae:'
-INSERT = '}}),re==null?null:(0,Y.jsx)(CodexLocalReadAloudButton,{getText:()=>Sr(f?.()??re),getHtml:()=>h?.(),getRoot:codexResponseRootGetter}),E,A,r===void 0?ae:'
 EARLY = '.vite/build/early-bootstrap.js'
 PRELOAD = '.vite/build/preload.js'
 MAIN = '.vite/build/local-read-aloud-main.cjs'
@@ -36,23 +37,6 @@ getVoices:()=>e.ipcRenderer.invoke("codex-local-read-aloud",{action:"voices"}),
 setVoice:voice=>e.ipcRenderer.invoke("codex-local-read-aloud",{action:"set_voice",voice}),
 onInterrupted:callback=>{const listener=(_event,payload)=>callback(payload);e.ipcRenderer.on("codex-local-read-aloud:interrupt",listener);return()=>e.ipcRenderer.removeListener("codex-local-read-aloud:interrupt",listener)}
 })'''
-
-SELECTION_BUTTON = '''globalThis.codexCanReadSelectionAloud?.(codexSelectionRoot,codexSelectionRange)?(0,UG.jsx)(HT,{
-"aria-label":"Read aloud","data-codex-local-read-aloud":"selection",
-onMouseDown:event=>event.preventDefault(),
-onClick:event=>{event.stopPropagation();globalThis.codexReadSelectionAloud(codexSelectionRoot,codexSelectionRange)},
-children:"Read aloud"
-}):null'''
-SELECTION_RETURN = 'let S;return t[41]!==_||t[42]!==v||t[43]!==y||t[44]!==b||t[45]!==x?(S=(0,UG.jsxs)(lje,{children:[_,v,y,b,x]}),t[41]=_,t[42]=v,t[43]=y,t[44]=b,t[45]=x,t[46]=S):S=t[46],S}var a3e,HG,UG;'
-
-def patch_selection_menu(text):
-    text = exact_replace(text, 'resume:l,selectedText:u}=e,d=n===void 0?',
-                         'resume:l,selectedText:u,readAloudRoot:codexSelectionRoot,readAloudRange:codexSelectionRange}=e,d=n===void 0?', 'Selection menu props')
-    text = exact_replace(text, 'onOpenSideChat:i})})},t[0]=n,t[1]=r,t[2]=i,t[3]=s',
-                         'onOpenSideChat:i,readAloudRoot:u,readAloudRange:l})})},t[0]=n,t[1]=r,t[2]=i,t[3]=s', 'Selection range routing')
-    # Render fresh range props even when another response contains identical text.
-    return exact_replace(text, SELECTION_RETURN,
-                         'return(0,UG.jsxs)(lje,{children:[_,v,y,b,x,' + SELECTION_BUTTON + ']})}var a3e,HG,UG;', 'Selection action menu')
 
 def leaf(tree, key):
     for part in key.split('/'):
@@ -173,7 +157,7 @@ def main():
         if body + max(offset + size for _, offset, size in original_entries) != original.stat().st_size:
             raise SystemExit('Unexpected archive body layout')
         source_js = {}
-        for key in (ASSET, SELECTION_ASSET, EARLY, PRELOAD, *HOST_GATE_ASSETS):
+        for key in (ASSET, VOICE_TIMELINE_ASSET, SELECTION_ASSET, EARLY, PRELOAD, *HOST_GATE_ASSETS):
             item = leaf(tree, key)
             stream.seek(body + int(item['offset']))
             data = stream.read(item['size'])
@@ -188,20 +172,14 @@ def main():
     picker = (ROOT / 'voice-picker.js').read_text()
     component = (ROOT / 'response-button.js').read_text()
     highlighting = (ROOT / 'response-highlight.mjs').read_text().replace('export ', '')
-    javascript = exact_replace(source_js[ASSET], ANCHOR, INSERT, 'Toolbar')
-    javascript = exact_replace(javascript, 'actionRowRef:M}=e,N=',
-                               'actionRowRef:M,getReadAloudRoot:codexResponseRootGetter}=e,N=', 'Response root props')
-    javascript = exact_replace(javascript, 'getCopyHtml:W?We:void 0,',
-                               'getCopyHtml:W?We:void 0,getReadAloudRoot:()=>ye.current?.querySelector(`[data-selected-text-overlay-target]`),', 'Scoped response root')
-    marker = javascript.rfind('export{')
-    if marker < 0:
-        raise SystemExit('Expected export boundary missing')
-    javascript = javascript[:marker] + '\n' + manager + '\n' + kokoro + '\n' + highlighting + '\n' + picker + '\n' + component + '\n' + javascript[marker:]
+    javascript = append_payload(patch_toolbar(source_js[ASSET]),
+                                '\n'.join((manager, kokoro, highlighting, picker, component)))
     replacement = javascript.encode('utf-8')
     (ROOT / 'patched-toolbar.mjs').write_bytes(replacement)
     subprocess.run(['node', '--check', str(ROOT / 'patched-toolbar.mjs')], check=True)
     replacements = {
         ASSET: replacement,
+        VOICE_TIMELINE_ASSET: patch_voice_timeline(source_js[VOICE_TIMELINE_ASSET]).encode(),
         SELECTION_ASSET: patch_selection_menu(source_js[SELECTION_ASSET]).encode(),
         EARLY: exact_replace(source_js[EARLY], EARLY_ANCHOR,
                              EARLY_ANCHOR + 'require("./local-read-aloud-main.cjs");',
@@ -210,7 +188,7 @@ def main():
                                BRIDGE + ',' + PRELOAD_ANCHOR, 'Preload').encode(),
         MAIN: (ROOT / 'kokoro-main.cjs').read_bytes(),
     }
-    for key in (SELECTION_ASSET, EARLY, PRELOAD, MAIN):
+    for key in (VOICE_TIMELINE_ASSET, SELECTION_ASSET, EARLY, PRELOAD, MAIN):
         syntax_file = ROOT / ('patched-' + Path(key).name)
         syntax_file.write_bytes(replacements[key])
         subprocess.run(['node', '--check', str(syntax_file)], check=True)
@@ -252,6 +230,7 @@ def main():
     info['CFBundleIdentifier'] = 'local.edoise.codex.readaloud'
     info['CodexReadAloudVoicePickerVersion'] = 1
     info['CodexReadAloudSelectionHighlightVersion'] = 1
+    info['CodexReadAloudSpeechAdapterVersion'] = ADAPTER_VERSION
     info['CodexReadAloudSkipCodeBlocksVersion'] = 1
     # Avoid registering the experimental copy for the official app's deep links.
     info.pop('CFBundleURLTypes', None)
