@@ -1,5 +1,6 @@
 """Verifier and staging checks use tiny local fixtures, never an installed app."""
 from contextlib import contextmanager
+import ast
 import hashlib
 import json
 import os
@@ -151,6 +152,23 @@ def check(data, **kwargs):
 
 
 class VerifierTests(unittest.TestCase):
+    def test_real_builder_adapter_marker_is_accepted_by_verifier(self):
+        # Exercise the builder's actual plist assignment rather than repeating
+        # a fixture marker that could disagree with the app we would ship.
+        tree = ast.parse(Path(__file__).with_name('build_copy.py').read_text())
+        assignments = [node for node in ast.walk(tree)
+                       if isinstance(node, ast.Assign)
+                       and isinstance(node.value, ast.Name)
+                       and node.value.id == 'ADAPTER_VERSION']
+        self.assertEqual(len(assignments), 1)
+        with fixture() as data:
+            data.info.pop('CodexReadAloudSpeechHostAdapterVersion')
+            namespace = {'info': data.info, 'ADAPTER_VERSION': speech_host.ADAPTER_VERSION}
+            exec(compile(ast.Module(body=assignments, type_ignores=[]),
+                         'builder_adapter_marker', 'exec'), namespace)
+            (data.app / 'Contents/Info.plist').write_bytes(plistlib.dumps(data.info))
+            self.assertTrue(check(data)['staticUIAdapterVerified'])
+
     def test_complete_staged_and_installed_scopes_and_voice_are_read_only(self):
         with fixture() as data:
             settings = (data.runtime / 'settings.json').read_bytes()

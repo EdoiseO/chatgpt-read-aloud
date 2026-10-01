@@ -196,3 +196,34 @@ candidate; verify the real native widgets at narrow widths, voice/fallback
 dialogs, one temporary Stop control, chat switching and scrolling, exact spoken
 selection, highlighting, and audible playback. Preserve commit and ASAR identity
 with that evidence. Keep signing and updater work in separate changes.
+
+## Desktop trial preparation — October 1, 2026
+
+The user subsequently authorized trying the UI experiment. Preparation uses the
+existing maintenance directory and activation journal in `codex-read-aloud`;
+the published `main` checkout remains unchanged. The installed baseline was
+fully verified and APFS-cloned to that maintenance directory's usual stage.
+
+The first real packaging review found that the builder wrote
+`CodexReadAloudSpeechAdapterVersion`, while verification expected
+`CodexReadAloudSpeechHostAdapterVersion`. The builder now writes the expected
+key. A regression test executes the actual builder assignment against the
+verifier fixture, so a duplicated fixture value cannot hide this mismatch.
+The full UI acceptance gate passed again, including this additional test.
+
+The candidate was built and passed optimized verification of all 20,353 packed
+assets, code signatures, embedded archive integrity, adapter 5, source payloads,
+profile binding, and existing Aoede settings. Candidate ASAR header:
+`5f3a5e454c8245a15705714817694a305115915bc8204f8eacea2d9cca153079`.
+
+The existing launcher was retained; no recompilation, runtime migration,
+certificate change, or updater implementation change was needed. The unchanged
+maintenance installer passed its preflight. It will retain the previous app and
+wait for a normal Quit before replacement. A successful source/stage check is
+not evidence that this candidate has launched or that its speech is audible.
+
+Local evidence is in `output/desktop-trial/`. The original activation journal
+and readiness report are preserved there before scheduling. macOS access
+prompts can still recur with the existing ad-hoc signing method. After the trial
+starts, check installed verification and canonical launch registration, then
+test the three UI examples and Stop/Escape in the actual app.
