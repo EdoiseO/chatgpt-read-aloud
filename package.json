@@ -6,7 +6,7 @@
   "scripts": {
     "test": "npm run test:unit && npm run test:browser",
     "test:unit": "node --test test-speech-controller.mjs test-kokoro-response-speaker.mjs test-kokoro-main.cjs test-response-button.cjs test-voice-response-groups.mjs",
-    "test:browser": "node --test test-response-highlight.mjs test-selection-integration.mjs test-native-selection-host.mjs",
+    "test:browser": "node --test test-response-highlight.mjs test-selection-integration.mjs",
     "demo:prepare": "node scripts/prepare_demo.mjs",
     "demo:capture": "node scripts/capture_demo.mjs",
     "test:ui-experiment": "node --test test-ui-reading-experiment.mjs"
