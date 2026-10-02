@@ -282,6 +282,14 @@ automation cannot control Codex.
 - **Selected passage:** select part of that response and use its speaker or the
   floating **Read aloud** action. Only the selected passage is spoken. A
   selection spanning separate responses must not be accepted as one passage.
+- **Larger selections:** expand a paragraph selection through nearby headings
+  or list items in one saved voice/research answer. Read aloud should remain
+  available and speak the selected prose. Repeat after scrolling and with a
+  narrow window. Older history without shared ownership may be limited to one
+  registered text block.
+- **Controls:** ordinary speech/voice controls share the native action row and
+  hover/focus behavior. Completed progress prose supports selection reading
+  without an extra idle toolbar; a supported grouped answer has one footer.
 - **Code blocks:** read a response with prose before and after a code block.
   It skips the code and its header, then continues with the next paragraph.
   Selecting only the code produces no speech and never reads the whole response.
@@ -291,7 +299,10 @@ automation cannot control Codex.
   the saved choice remains. Save a chosen voice, quit/reopen, and confirm the next
   response uses it automatically. Stop playback before testing another choice.
 - **Stop and switch:** click the active speaker again while preparing or playing
-  audio. It stops promptly. Starting another response stops the earlier one.
+  audio. It stops promptly. When reading text without a response action row,
+  also test the compact Stop control and Escape. Active controls remain reachable
+  when the pointer leaves.
+  Starting another response stops the earlier one.
 - **Playback highlight:** the soft yellow highlight follows the sentence whose
   audio is actually playing, including the final chunk. It does not jump ahead
   to prefetched audio. It clears on stop, finish, error, preparation gaps, and

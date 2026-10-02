@@ -1,9 +1,11 @@
-# Reading UI experiment
+# Reading UI experiment — historical plan and evidence
 
-This is an isolated, **uninstalled UI experiment** based on published commit
-`e63c9824105662301604bc5eed36f2783069beb5`. It addresses the three selection and
-toolbar examples reported on October 1, 2026. The current installed app and the
-main checkout remain unchanged.
+This document records the October 1, 2026 experiment based on
+`e63c9824105662301604bc5eed36f2783069beb5`, including its earlier source-only
+validation and first desktop candidate. The final adapter 6 implementation was
+installed later and the user reported it stable on October 2. See the
+[current UI fix and deployment report](UI_HOVER_SELECTION_FIXES.md) for that
+result. Earlier hashes and test counts below describe their respective stages.
 
 ## Scope
 
@@ -13,9 +15,9 @@ published installer, launcher, updater suppression, signing commands, speech
 engine, runtime, and saved-voice behavior. It adds no update checker,
 LaunchServices repair, certificate migration, or installation workflow.
 
-Do not build, install, sign, register, or launch a desktop candidate as part of
-these checks. Reading the official app's pinned assets for offline tests does
-not launch that app. A later desktop trial needs its own explicit release plan.
+These source checks do not build, install, sign, register, or launch a desktop
+candidate. Reading the official app's pinned assets for offline tests does not
+launch that app. Desktop activation is a separate verified step.
 
 ## Acceptance contract for the three examples
 
@@ -189,7 +191,7 @@ voice-response-groups.mjs    e0ff854a965619285a4e17921b167d74748c15ef91c5c4cbc4f
 Offline fixtures can establish the code paths, selection text, lifecycle, and
 the layout they actually render. They cannot establish audible quality, macOS
 permissions, real desktop scrolling/virtualization, or a successful installed
-upgrade. This experiment stays uninstalled after its automated tests pass.
+upgrade. At this source-only milestone, the experiment was still uninstalled.
 
 Before any future desktop release, reproduce all three examples on that exact
 candidate; verify the real native widgets at narrow widths, voice/fallback

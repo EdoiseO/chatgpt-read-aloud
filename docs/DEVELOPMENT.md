@@ -26,6 +26,20 @@ component licenses.
 
 ## Reading behavior
 
+Ordinary completed replies place speech and voice choice inside the native
+action row, using its hover/focus policy. Playback or an open picker keeps the
+controls reachable. Completed progress prose remains available through selection
+without an extra idle toolbar. A supported saved voice/research answer has one
+footer, rather than controls after every fragment.
+
+Selections can cross completed paragraphs, headings, lists, and table prose
+owned by the same logical answer, including completed parts of a partially
+loaded answer. The original selected range is preserved. Unfinished or unrelated
+text, missing roots, and cross-answer ranges are rejected. Legacy history with
+no explicit shared owner remains bounded to its individual registered response.
+Reading text without a response action row provides a compact native-style Stop
+control; Escape also cancels reading. See the [UI fix report](UI_HOVER_SELECTION_FIXES.md).
+
 Read aloud skips code blocks and continues with the surrounding explanation.
 This applies to whole responses and selected passages. A selection containing
 only a code block produces no speech and never expands to the whole response.
@@ -84,7 +98,22 @@ python3 test-kokoro-worker-sentences.py
 The default tests cover response ownership, cancellation, voice preview/save,
 selection routing, real DOM ranges/highlights in a fresh offline browser, and
 install/update behavior using temporary fixtures. They do not control the
-installed desktop app. Runtime audio checks additionally require the completed
+installed desktop app. The default Node tests do not require the proprietary
+desktop bundle; optional Python host probes skip when it is absent.
+
+On a Mac with the pinned official app, also run:
+
+```sh
+npm run test:ui-experiment
+```
+
+This local acceptance gate requires the actual host assets and rejects skipped
+checks. It covers native menu routing, compiler cache reuse, grouped selections,
+hover/focus geometry, and compact Stop styling. It also checks that installer,
+updater, signing, and speech-runtime code still matches the reviewed baseline.
+The command retains its original experiment name; it verifies the released UI.
+
+Runtime audio checks additionally require the completed
 local speech setup:
 
 ```sh
@@ -105,6 +134,8 @@ The source layout is deliberately small:
 | --- | --- |
 | `response-button.js`, `voice-picker.js` | Response controls and voice chooser |
 | `response-highlight.mjs` | Visible text mapping, selected ranges, sentence highlight |
+| `speech_host_adapter.py`, `selection_host_adapter.py` | Pinned host renderers, action rows, and native selection-menu integration |
+| `voice-response-groups.mjs`, `voice-response-group-host.js` | Logical answer ownership and shared controls for saved voice/research text |
 | `kokoro-response-speaker.mjs`, `speech-controller.mjs` | Audio ownership, playback progress, fallback |
 | `kokoro-main.cjs`, `kokoro_worker.py` | Validated local IPC and offline speech worker |
 | `setup_runtime.py`, `runtime/` | Pinned dependency and model setup |

@@ -9,8 +9,10 @@ own profile.
 ## Features
 
 - Read a completed response or **just the text you select**, skipping code blocks.
+- Select across paragraphs, headings, and lists within the same supported answer.
+- Speech and voice controls share the response's native action row and hover behavior.
 - Follow a **soft yellow highlight** during Kokoro playback.
-- Stop playback or switch to another response.
+- Stop playback with **Escape** or the active reading control, or switch responses.
 - Preview and save your choice of **28 English voices**.
 - Choose **Use Mac voice** if the local speech helper cannot start.
 
@@ -24,6 +26,16 @@ generation still uses OpenAI.
 **Read selected text.** Highlight a passage and choose **Read aloud**.
 
 [See the screenshots](docs/SCREENSHOTS.md).
+
+Completed progress text can be read through selection without adding another
+toolbar. A compact **Stop** control appears during reading when no response
+toolbar is available. Saved voice/research answers use one reading footer for
+each supported logical answer. During playback or voice selection, the active controls stay
+accessible. Status labels, unfinished text, and selections across unrelated
+answers are excluded; older history without shared answer metadata remains
+limited to its individual text blocks.
+
+[Reading UI fixes and verification](docs/UI_HOVER_SELECTION_FIXES.md).
 
 ## Install
 

@@ -1,5 +1,10 @@
 # Hover and selection follow-up — October 1, 2026
 
+**Current status — October 2:** adapter 6 from source commit `3d0336c` is
+installed. The user reports this version is very stable and approved publishing
+it to `main`. The changes cover native hover behavior, larger same-answer
+selections, and the compact Stop control.
+
 ## User-visible problems and causes
 
 ### 1. Speech controls remained visible after pointer leave
@@ -77,22 +82,32 @@ See [MDN CSS pseudo-classes](https://developer.mozilla.org/en-US/docs/Web/CSS/Re
   restoration checks against the pinned official source.
 - Independent review checked cancellation, pending/foreign content rejection,
   native memo-cache reuse, and nested hover behavior.
-- `git diff --check` passes. The installed ASAR header is unchanged.
+- `git diff --check` passed. At the source-validation stage, the installed app
+  remained unchanged.
 
-## Deployment boundary
+## Deployment and evidence limits
 
-The installed app remains the previous trial (adapter 5, ASAR
-`5f3a5e454c8245a15705714817694a305115915bc8204f8eacea2d9cca153079`).
-This follow-up uses adapter 6. No app replacement, signing change, runtime update,
-preferences change, or activation has been performed for this revision.
+Adapter 6 was installed on October 1. The installed archive header is
+`dcb9f32a777fb66d83370ee21364629040d4178df715c1628c6b85cedd372577`.
+Full verification checked 20,353 packed assets, code signatures, embedded archive
+integrity, exact UI payloads, profile binding, and preserved Aoede settings.
 
-Two checks prevent preparing another ordinary activation safely:
+Low disk space and the retained-backup limit initially blocked preparation.
+The user approved removing three unused older backups, while preserving the
+running app and GitHub baseline. The existing installer naturally omitted those
+missing aliases in the next transaction; its limit and code were unchanged.
 
-- Available disk space is under 900 MiB. Rebuilding the ASAR (514 MiB) and
-  signed framework (258 MiB) alone would leave very little working space.
-- The next transaction would retain nine historical resource aliases, above
-  the installer's existing limit of eight. It has no supported compaction command.
+The first activation entered recovery one second before the current app process
+started. Startup timing is a possible cause; the installer did not record the
+original exception. A subsequent full startup check passed twice. A reviewed
+manual recovery preserved the failed journal and previous build, cancelled only
+the matching recovery waiter, acquired the activation lock, and repeated bundle,
+process, resource, profile, and startup checks before recording completion.
+This is not a new installer feature or a general recovery command.
 
-Do not edit activation state or move/delete backups simply to bypass the limit.
-A separate reviewed cleanup/state-maintenance plan is needed before installing.
-All source fixes and test evidence can be retained without changing the running app.
+On October 2, the user reported stable desktop use. This confirms their
+experience on this installation; it does not establish compatibility with a
+new official release or another Mac. The initial activation failure remains a
+known diagnostic limitation. Installer, updater, signing, and speech-runtime
+source are unchanged by this UI release. Private deployment and cleanup records
+remain local and are excluded from Git.
