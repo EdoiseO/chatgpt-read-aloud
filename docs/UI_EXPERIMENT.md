@@ -3,7 +3,7 @@
 This document records the October 1, 2026 experiment based on
 `e63c9824105662301604bc5eed36f2783069beb5`, including its earlier source-only
 validation and first desktop candidate. The final adapter 6 implementation was
-installed later and the user reported it stable on October 2. See the
+installed later and I found it stable on October 2. See the
 [current UI fix and deployment report](UI_HOVER_SELECTION_FIXES.md) for that
 result. Earlier hashes and test counts below describe their respective stages.
 
@@ -148,7 +148,7 @@ The final local acceptance gate passed: **3 checks passed, 0 failed, 0 skipped**
 It completed in 7.6 seconds using the existing Playwright installation:
 
 ```sh
-PLAYWRIGHT_MODULE_PATH=/Users/edoise/Documents/Playground/chatgpt-read-aloud/node_modules/playwright \
+PLAYWRIGHT_MODULE_PATH="$PWD/node_modules/playwright" \
   node --test test-ui-reading-experiment.mjs
 ```
 
@@ -201,8 +201,8 @@ with that evidence. Keep signing and updater work in separate changes.
 
 ## Desktop trial preparation — October 1, 2026
 
-The user subsequently authorized trying the UI experiment. Preparation uses the
-existing maintenance directory and activation journal in `codex-read-aloud`;
+I prepared the UI experiment using the existing maintenance directory and
+activation journal in `codex-read-aloud`;
 the published `main` checkout remains unchanged. The installed baseline was
 fully verified and APFS-cloned to that maintenance directory's usual stage.
 

@@ -58,3 +58,7 @@ The official ChatGPT app's updates remain independent.
 [Behavior details and development notes](docs/DEVELOPMENT.md).
 
 [MIT license](LICENSE) · [Model and dependency credits](THIRD_PARTY.md)
+
+## How I built this
+
+I built this read-aloud add-on with AI coding assistants (ChatGPT/Codex and Claude) to speed up implementation and review; I am responsible for the architecture and can walk through the code.

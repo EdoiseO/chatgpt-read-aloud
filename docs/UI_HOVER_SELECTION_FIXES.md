@@ -1,8 +1,8 @@
 # Hover and selection follow-up — October 1, 2026
 
 **Current status — October 2:** adapter 6 from source commit `3d0336c` is
-installed. The user reports this version is very stable and approved publishing
-it to `main`. The changes cover native hover behavior, larger same-answer
+installed. I found this version stable in desktop use. The changes cover native
+hover behavior, larger same-answer
 selections, and the compact Stop control.
 
 ## User-visible problems and causes
@@ -93,8 +93,8 @@ Full verification checked 20,353 packed assets, code signatures, embedded archiv
 integrity, exact UI payloads, profile binding, and preserved Aoede settings.
 
 Low disk space and the retained-backup limit initially blocked preparation.
-The user approved removing three unused older backups, while preserving the
-running app and GitHub baseline. The existing installer naturally omitted those
+I removed three unused older backups while preserving the running app and
+GitHub baseline. The existing installer naturally omitted those
 missing aliases in the next transaction; its limit and code were unchanged.
 
 The first activation entered recovery one second before the current app process
@@ -105,7 +105,7 @@ the matching recovery waiter, acquired the activation lock, and repeated bundle,
 process, resource, profile, and startup checks before recording completion.
 This is not a new installer feature or a general recovery command.
 
-On October 2, the user reported stable desktop use. This confirms their
+On October 2, I found the installation stable in desktop use. This reflects my
 experience on this installation; it does not establish compatibility with a
 new official release or another Mac. The initial activation failure remains a
 known diagnostic limitation. Installer, updater, signing, and speech-runtime

@@ -180,7 +180,7 @@ process.stdin.on('end', () => {
   assert.match(speechOnlyRow.props.children[0].props.className, /opacity-0/);
   assert.equal(speech(speechOnlyRow).length, 1);
 
-  // Historical events in the user's report are canonical transcriptSegment and
+  // The reported historical events are canonical transcriptSegment and
   // bemItemPromoted/inlineMarkdown entries, not the legacy fx transcript path.
   // Neutral content below reproduces their structure without private history.
   function voice(name, props, key) {
